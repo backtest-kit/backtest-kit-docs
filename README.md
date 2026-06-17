@@ -1539,6 +1539,32 @@ Each strategy example showcases a different aspect of Backtest Kit's capabilitie
 
 These examples are not toy demonstrations — they are **production-quality strategies** that have been backtested on real historical data with documented results. You can clone the repository, run the backtests, and see the exact performance metrics for yourself.
 
+## Portfolio Analytics & Pooled Sharpe Ratio
+
+Evaluating a multi-asset portfolio requires more than just averaging the performance of individual symbols. In earlier versions, the framework calculated a "Portfolio Sharpe" as a trade-count-weighted average of per-symbol Sharpes. Mathematically, this is flawed — a true Markowitz Portfolio Sharpe requires a cross-symbol correlation matrix and capital allocation weights, neither of which the framework tracks. Averaging ratios often creates a false sense of security, artificially inflating the metric if one symbol has a high Sharpe while another has a negative one.
+
+### The Shift to "Pooled Sharpe"
+Starting from v10.2.0, the framework replaces the flawed average with a statistically rigorous **Pooled Sharpe Ratio**. 
+
+**How It Works:**
+Instead of averaging individual ratios, the engine pools all per-trade returns across every symbol in the portfolio into a single, unified sample. The Sharpe Ratio is then computed on this pooled distribution. 
+
+**Why It Matters:**
+- **Statistical Honesty:** It accurately reflects the risk-adjusted returns of the portfolio as a whole, correctly penalizing strategies that have high variance across different assets.
+- **No False Positives:** Prevents the illusion of a "good" portfolio Sharpe that is mathematically unjustified.
+- **Transparent Labeling:** The Markdown header label was explicitly changed from `Portfolio Sharpe` to `Pooled Sharpe`, and the report legend includes a disclaimer about Markowitz semantics, ensuring you never mistake it for a covariance-based optimization metric.
+
+### A Complete Rewrite of the Analytics Engine
+This change is part of a massive overhaul of the statistical suite. To ensure every metric is battle-tested and mathematically sound, the entire analytics layer was rebuilt against canonical definitions and verified against an independent reference implementation (an 84-file measure testbed):
+
+- **Sample Standard Deviation:** Switched to Bessel's correction (`N-1`) for unbiased variance estimation, preventing the underestimation of risk in small sample sizes.
+- **Compounded Equity-Curve:** Max Drawdown, Calmar, and Recovery Factor now use a compounded equity curve rather than additive arithmetic sums, preventing the double-counting of percentage returns.
+- **Geometric Annualization:** Expected Yearly Returns now use geometric compounding instead of arithmetic multiplication, correctly accounting for volatility drag (the mathematical reality that a 50% loss requires a 100% gain to recover).
+- **Canonical Sortino:** Implements the textbook Sortino (1991) formula with downside deviation over the total sample size (`N_total`), properly penalizing strategies with frequent small losses instead of just looking at the worst days.
+- **Float-Artifact Guards:** Identical-return series produce a standard deviation of `≈1e-17` due to floating-point math. Without a guard, `Sharpe = Avg / 1e-17` produces astronomical magnitudes. The engine now uses an `STDDEV_EPSILON` guard to return `N/A` instead of publishing a fake Sharpe of `10,000,000`.
+
+**Problem Solved:** Publishing astronomically high or mathematically impossible Sharpe/Sortino ratios due to tiny sample sizes, float-artifact standard deviations, or incorrect arithmetic averaging. The new engine includes strict gating thresholds (e.g., minimum 10 signals, minimum 14 calendar days) to return `N/A` instead of misleading numbers, ensuring that the metrics you base your financial decisions on are mathematically bulletproof.
+
 ## Conclusion
 
 Backtest Kit solves the fundamental challenges of building reliable trading systems through:
