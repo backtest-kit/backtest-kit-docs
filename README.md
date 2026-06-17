@@ -1279,6 +1279,266 @@ But the moment you need to **deploy a strategy to production**, manage **complex
 
 ---
 
+## Universal LLM Inference Adapter
+
+Building AI-powered trading strategies typically requires integrating with multiple LLM providers, each with its own API format, authentication method, and response structure. Developers end up writing boilerplate code to handle OpenAI's format, then Claude's format, then DeepSeek's format — and managing API key rotation, structured output enforcement, and error handling across all of them.
+
+**The Backtest Kit Solution:** `@backtest-kit/ollama` provides a **universal inference adapter** that abstracts away provider differences, letting you switch between 10+ LLM providers with a single line of code while maintaining type-safe, structured output.
+
+### Multi-Provider Abstraction
+Instead of learning and maintaining separate SDKs for each provider, you use a unified Higher-Order Function (HOF) API. Wrap your signal generation function with `deepseek()`, `claude()`, `gpt5()`, or `ollama()`, and the adapter handles provider-specific formatting, authentication, and error handling automatically.
+
+**Supported Providers:**
+- OpenAI (GPT-5, GPT-4o)
+- Anthropic Claude
+- DeepSeek
+- Grok (xAI)
+- Mistral
+- Perplexity
+- Cohere
+- Alibaba (Qwen)
+- Hugging Face
+- Ollama (local models)
+- GLM-4 (Zhipu AI)
+
+**Problem Solved:** Provider lock-in and API fragmentation. You can test your strategy with DeepSeek during development, switch to Claude for production, and fall back to local Ollama if cloud APIs are unavailable — all without changing your strategy code.
+
+### Structured Output Enforcement
+Trading signals require specific fields: position direction, entry price, take-profit, stop-loss, risk notes. Raw LLM outputs are unpredictable — they might return markdown, JSON with missing fields, or hallucinated values.
+
+The adapter integrates with `agent-swarm-kit` to enforce **Zod schemas** or JSON schema validation. You define the expected structure once, and the adapter guarantees every LLM response conforms to it before reaching your strategy logic.
+
+**Key Features:**
+- Zod schema validation with automatic retry on malformed output
+- Custom validation rules (e.g., "stop-loss must be below entry for LONG")
+- Trading-specific field descriptions injected into prompts
+- Type-safe TypeScript interfaces generated from schemas
+
+**Problem Solved:** Unstructured LLM outputs crash strategies or generate invalid trades. Schema enforcement ensures every signal is valid before execution.
+
+### Token Rotation and Fallback Chains
+Cloud LLM APIs have rate limits, and single API keys can exhaust quotas during intensive backtesting or live trading. The adapter supports **automatic token rotation** — pass an array of API keys, and the system rotates through them to distribute load.
+
+For production resilience, you can configure **fallback chains**: if DeepSeek is unavailable, automatically retry with Claude; if Claude fails, fall back to local Ollama. This ensures your strategy never stops generating signals due to provider outages.
+
+**Problem Solved:** Rate limiting and provider downtime halt trading. Token rotation and fallback chains maintain continuous operation.
+
+### Userspace Prompts and Memoization
+Prompt engineering is iterative — you need to tweak system prompts, add context, and test variations. The adapter loads prompts from `.cjs` modules in your `config/prompt/` directory, making them easy to edit without touching strategy code.
+
+To avoid redundant API calls during backtesting (where the same candle data might be analyzed multiple times), the adapter **memoizes prompt modules** using `functools-kit`. Identical inputs return cached responses, dramatically reducing API costs and latency.
+
+**Problem Solved:** Prompt management scattered across strategy files, and redundant API calls during backtesting. Centralized prompt modules with memoization solve both issues.
+
+### Trading-Specific Context Injection
+Unlike generic LLM wrappers, `@backtest-kit/ollama` is designed for trading. System prompts automatically receive context about the current symbol, strategy name, exchange, timeframe, and whether you're in backtest or live mode. This allows your prompts to adapt dynamically without manual string interpolation.
+
+**Problem Solved:** Generic LLM adapters don't understand trading context. Trading-specific prompts produce more relevant signals and risk assessments.
+
+---
+
+## Production Strategy Examples
+
+Most trading frameworks provide toy examples — moving average crossovers on daily data that work in tutorials but fail in production. Backtest Kit includes **real-world strategy examples** that demonstrate advanced position management, multi-timeframe analysis, AI integration, and alternative signal sources. Each example is fully documented with backtest results, Sharpe ratios, and implementation details.
+
+### Neural Network Strategy (October 2021)
+**Signal Source:** TensorFlow feed-forward neural network trained on normalized candle patterns
+
+**How It Works:**
+- Every 8 hours, the strategy fetches 58 candles (50 for training, 8 for prediction)
+- A neural network (8→6→4→1 architecture) is trained on normalized data, where each candle's close is mapped to [0,1] representing its position within the high-low range
+- Every 15 minutes, if the current price is below the predicted price, a LONG position is opened with a 1% hard stop
+- Positions exit via trailing take-profit: when profit retraces 1% from its peak (e.g., position hits +3%, closes at +2%)
+
+**Results:** +18.26% PNL, Sharpe Ratio 0.31
+
+**Key Techniques Demonstrated:**
+- Real-time model training within strategy execution
+- Normalization for stable neural network inputs
+- Trailing take-profit for dynamic exits
+- Integration with TensorFlow.js in Node.js
+
+**Problem Solved:** Static technical indicators fail to adapt to changing market regimes. Neural networks can learn non-linear patterns, but integrating them into a trading system requires careful handling of training data, prediction timing, and position management.
+
+---
+
+### Pine Script Range Breakout (December 2025)
+**Signal Source:** TradingView Pine Script indicator executed via `@backtest-kit/pinets`
+
+**How It Works:**
+- Every hour, the strategy runs `btc_dec2025_range.pine` on 1h candles
+- The Pine Script extracts: Bollinger Bands, range boundaries, signal direction (±1), ranging flag, and volume spike detection
+- A signal fires on `signal === 1` (LONG) or `signal === -1` (SHORT), but only if the price hasn't already moved past the signal close and the market isn't ranging
+- Each position uses a fixed ±2% bracket (TP and SL), no DCA, no trailing
+
+**Results:** +2.40% PNL, Sharpe Ratio 0.06
+
+**Key Techniques Demonstrated:**
+- Running TradingView Pine Script directly in Node.js
+- Extracting multiple outputs from a single Pine indicator
+- Filtering signals based on market state (ranging vs. trending)
+- Fixed bracket exits for mean-reversion strategies
+
+**Problem Solved:** Traders have thousands of hours invested in Pine Script indicators. Rewriting them in JavaScript is time-consuming and error-prone. Direct Pine Script execution preserves existing work while enabling backtesting and live deployment.
+
+---
+
+### Signal Inversion Strategy (January 2026)
+**Signal Source:** Real Telegram channel signals (Crypto Yoda), inverted
+
+**How It Works:**
+- Signals are loaded from `assets/entry.jsonl` — 11 real posts from a Telegram channel, exported verbatim
+- On each candle, `getSignal` checks if `publishedAt` matches the current minute and whether `closePrice` falls inside `entry.from..entry.to`
+- The strategy enters **counter-trend** (inverts the channel's direction) with trailing take-profit and no fixed TP
+- Stop-loss is set to -0.5%
+
+**Results:** +8.58% PNL, **Sharpe Ratio 1.14** (highest in the example set)
+
+**Key Techniques Demonstrated:**
+- Exploiting predictable signal sources (channels with algorithmic posting)
+- Counter-trend entry based on liquidity harvesting
+- Trailing take-profit for maximizing gains
+- Loading external signal data into backtest
+
+**Problem Solved:** Many Telegram channels publish signals with poor risk-reward ratios and algorithmic timing. By reverse-engineering the algorithm and entering counter-trend, you can harvest the liquidity created by followers blindly copying the signals.
+
+---
+
+### AI News Sentiment Strategy (February 2026)
+**Signal Source:** LLM analysis of live crypto/macro news via Tavily + Ollama
+
+**How It Works:**
+- Every 4–8 hours, a Tavily search fetches the latest Bitcoin and macro headlines
+- The raw news text is passed to a local Ollama model, which returns one of `bullish`, `bearish`, or `wait`
+- `getSignal` opens a LONG on `bullish`, SHORT on `bearish`, and skips on `wait`
+- A conflicting forecast while a position is open triggers `commitClosePending` (sentiment flip)
+- Positions exit on trailing take-profit (1% drawdown from peak) or stop-loss (1% from entry)
+
+**Results:** +16.99% PNL, Sharpe Ratio 0.25 (during a month where BTC fell -16.4%)
+
+**Key Techniques Demonstrated:**
+- Integrating LLM inference into signal generation
+- Using external news APIs (Tavily) for real-time data
+- Sentiment-based position flipping
+- Trailing exits for trending markets
+
+**Problem Solved:** Technical indicators lag price action. News sentiment can provide leading signals, but parsing news manually is impractical. LLMs can analyze headlines in real-time and generate directional bias, enabling news-driven strategies.
+
+---
+
+### SHORT DCA Ladder (March 2026)
+**Signal Source:** Fixed SHORT signal with dynamic Dollar-Cost Averaging
+
+**How It Works:**
+- `getSignal` opens a SHORT on every new pending signal via `Position.moonbag` with a 25% hard stop and $100 cost
+- While active, `commitAverageBuy` fires on each ping if the current price moves outside a ±1–5% band around the last entry and fewer than 10 rungs have been added
+- The position closes as soon as blended portfolio PNL reaches +0.5% via `commitClosePending`
+
+**Results:** +37.83% PNL, Sharpe Ratio 0.35
+
+**Key Techniques Demonstrated:**
+- Dynamic DCA ladder with overlap detection
+- Blended cost basis tracking across multiple entries
+- Target-based exit (close at specific PNL threshold)
+- Short-biased mean-reversion strategy
+
+**Problem Solved:** Single-entry SHORT positions in volatile markets often get stopped out before the reversal. DCA ladders allow you to average into the position as price spikes, lowering the blended entry and increasing the probability of hitting a small profit target on the reversal.
+
+---
+
+### LONG DCA Ladder (April 2026)
+**Signal Source:** Fixed LONG signal with dynamic Dollar-Cost Averaging
+
+**How It Works:**
+- Same mechanics as SHORT version but LONG-biased with a 3% profit target
+- Deployed 2.4 entries per trade on average
+- Achieved +67.85% PNL on deployed capital with improved percentage drawdown (-2.59% vs -3.99% without DCA)
+
+**Results:** +67.85% PNL, Sharpe Ratio 0.12
+
+**Key Techniques Demonstrated:**
+- Long-biased DCA in trending bull markets
+- Comparison of DCA vs. single-entry performance
+- Drawdown analysis with and without averaging
+
+**Problem Solved:** In trending markets, single entries miss opportunities to add to winning positions. DCA ladders allow you to scale into trends while maintaining a favorable risk-reward profile.
+
+---
+
+### Python EMA Crossover (February 2021)
+**Signal Source:** Python-based EMA crossover executed via WebAssembly (WASI)
+
+**How It Works:**
+- Every 8 hours, `Cache.fn` runs the Python indicator (`strategy.py`) on 8h candles to calculate EMA(9) and EMA(21)
+- A signal fires based on EMA crossover and 4h range midpoint confirmation: if EMA(9) > EMA(21), open LONG; otherwise SELL
+- Each signal opens a $100 bracket position via `Position.bracket` with ±2% take-profit and stop-loss
+- The strategy deployed $3,300 across 33 trades (all LONG), achieving +$5.52 (+0.17%) with a 63.6% win rate
+
+**Results:** +5.52% PNL, Sharpe Ratio 0.09
+
+**Key Techniques Demonstrated:**
+- Running Python indicators in Node.js via WebAssembly
+- Multi-timeframe confirmation (8h EMA + 4h range)
+- Bracket orders for fixed risk-reward
+- Integration with Python ecosystem from TypeScript
+
+**Problem Solved:** Python has a rich ecosystem of technical analysis libraries (pandas, ta-lib, scikit-learn), but integrating them into Node.js trading systems is difficult. WebAssembly execution allows you to run Python code directly in your TypeScript strategies without rewriting logic.
+
+---
+
+### Polymarket Δprob Strategy (April 2024)
+**Signal Source:** Prediction market probability shifts from Polymarket
+
+**How It Works:**
+- `loadPolySignals` reads `assets/polymarket-backtest-result.json` once via `singleshot`, aggregates to one signal per day (max `|dprob|` across all crypto-prices markets), and strips `entryPrice`/`exitPrice` (future-data fields)
+- `getSignal` picks the most recent signal with `timestamp ≤ when` and rejects it if older than 1h or `|dprob| < 0.10`
+- Positive Δprob → LONG, negative → SHORT
+- Entry via `Position.moonbag` at market with a 1% hard stop and no fixed TP
+- `listenActivePing` closes on 1% trailing drawdown from peak profit, or on the 24h timeout
+
+**Results:** 10 trades, 70% WR, Sharpe +0.065 — three SL hits (one per LONG on the April top) nearly cancel seven trailing-take SHORT wins on the recovery slope
+
+**Key Techniques Demonstrated:**
+- Using prediction markets as leading indicators
+- Aggregating signals across multiple markets
+- Time-based signal expiration
+- Trailing exits for asymmetric risk-reward
+
+**Problem Solved:** Prediction markets aggregate crowd wisdom about future events. Sharp shifts in probability can reflect retail sentiment flow that precedes spot price movement. By tracking Δprob (change in probability), you can exploit this leading indicator without look-ahead bias.
+
+---
+
+### What These Examples Demonstrate
+
+Each strategy example showcases a different aspect of Backtest Kit's capabilities:
+
+**Advanced Position Management:**
+- DCA ladders with overlap detection and blended cost basis
+- Partial profit/loss with dynamic cost adjustment
+- Trailing take-profit and stop-loss
+- Breakeven protection
+
+**Multi-Source Signal Generation:**
+- Technical indicators (EMA, Bollinger Bands, RSI)
+- Neural networks and machine learning
+- LLM-powered sentiment analysis
+- External data sources (Telegram, Polymarket, news APIs)
+- Pine Script indicators from TradingView
+
+**Realistic Backtesting:**
+- Look-ahead bias prevention
+- Accurate PNL with fees and slippage
+- Multi-timeframe synchronization
+- Crash-safe persistence
+
+**Production Deployment:**
+- Same code for backtest and live
+- Transactional broker commits
+- Risk management and validation
+- Event-driven monitoring
+
+These examples are not toy demonstrations — they are **production-quality strategies** that have been backtested on real historical data with documented results. You can clone the repository, run the backtests, and see the exact performance metrics for yourself.
+
 ## Conclusion
 
 Backtest Kit solves the fundamental challenges of building reliable trading systems through:
