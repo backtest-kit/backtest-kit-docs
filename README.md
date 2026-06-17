@@ -1671,6 +1671,34 @@ The web interface requires **zero configuration** — it auto-discovers register
 
 ---
 
+### 📉 The Indicator Ecosystem & Python Migration
+
+**The Pain Point:**
+For quantitative developers, Python is the undisputed king of technical analysis, boasting massive ecosystems like `Pandas`, `TA-Lib`, and `Scikit-learn`. In contrast, the native TypeScript ecosystem for financial indicators has historically been sparse. While Backtest Kit offers native Pine Script integration, developers deeply entrenched in Python might view the lack of native `TA-Lib` bindings as a critical bottleneck, fearing they would have to rewrite complex mathematical models and custom indicators from scratch.
+
+**The Solution:**
+Backtest Kit solves this not by forcing you to abandon your existing tools, but by providing a **multi-layered integration strategy** that brings the entire Python and TradingView ecosystem directly into your Node.js runtime, without breaking the type-safe, crash-safe architecture.
+
+**1. Native Pine Script Execution (`@backtest-kit/pinets`)**
+Instead of rewriting indicators in JavaScript, you can run native TradingView Pine Script (v5/v6) directly inside Node.js. This instantly grants you access to thousands of community-built indicators, custom strategies, and complex plotting logic. The framework handles the execution context, ensuring that Pine Script calculations are perfectly synchronized with the backtest timeline and strictly protected against look-ahead bias.
+
+**2. Built-in Multi-Timeframe Analysis (`@backtest-kit/signals`)**
+For standard technical analysis, the framework ships with a dedicated signals package featuring **50+ pre-computed indicators** (RSI, MACD, Bollinger Bands, Stochastic, ADX, ATR, CCI, Fibonacci, Support/Resistance). Crucially, it handles **multi-timeframe synchronization** (1m, 15m, 30m, 1h) automatically, generating structured Markdown reports optimized for LLM context injection.
+
+**3. Python via WebAssembly (WASI)**
+When you absolutely must use a Python-specific library (like `ta-lib`, `pandas`, or custom `scikit-learn` models), Backtest Kit supports executing Python code directly within your TypeScript strategy via **WebAssembly (WASI)**. This allows you to compile your existing Python indicator scripts into WASM and run them natively in the Node.js event loop. You get the exact mathematical output of Python without the IPC overhead, subprocess management, or serialization bottlenecks of traditional bridges.
+
+**4. Zero-Dependency Quant Math Ports**
+For advanced quantitative modeling, the ecosystem includes native TypeScript ports of complex financial mathematics (inspired by `vectorbt`). This includes modules for conditional variance modeling (`garch`), order-flow intensity and regime breaks (`volume-anomaly`), and coordinated speculation detection (`pump-anomaly`). These run natively in TypeScript, fully typed, and integrated directly with the `Exchange` schema.
+
+**5. High-Performance Custom Indicators via `Cache`**
+If you need to write custom indicators in TypeScript, the framework provides intelligent memoization and time-based caching (`Cache.fn` and `Cache.file`). Expensive calculations are automatically cached per candle-interval boundary, ensuring that your custom logic runs at O(1) speed on subsequent ticks without consuming excessive memory or triggering garbage collection pauses.
+
+**The Bottom Line:**
+You do not need to choose between the rich indicator ecosystem of Python/TradingView and the production-grade reliability of TypeScript. Backtest Kit acts as a universal bridge, allowing you to leverage Pine Script, Python WASM, and native quant ports seamlessly, all while maintaining strict temporal alignment and type safety.
+
+---
+
 ## Conclusion
 
 Backtest Kit solves the fundamental challenges of building reliable trading systems through:
