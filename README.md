@@ -1,0 +1,1152 @@
+# Backtest Kit Documentation
+
+## Introduction
+
+Backtest Kit is a production-ready TypeScript framework for algorithmic trading that solves the fundamental challenges of building reliable trading systems. Unlike research-focused libraries, it provides battle-tested solutions for the real-world problems that emerge when moving from backtesting to live trading.
+
+This documentation explains the core concepts, design decisions, and problem-solving approaches that make Backtest Kit suitable for production trading systems.
+
+---
+
+## Core Concepts
+
+### Signal Lifecycle State Machine
+
+Every trading position follows a strict lifecycle: **idle → opened → active → closed**. This state machine is enforced through TypeScript discriminated unions, making invalid states unrepresentable at compile time.
+
+**Problem Solved:** Traditional trading systems often suffer from state corruption where positions exist in ambiguous states (partially opened, unclear if closed, etc.). Backtest Kit eliminates this class of bugs entirely.
+
+**Key Benefits:**
+- Impossible to access closed position data
+- Impossible to modify opened position as if it were active
+- Type-safe access to position properties based on current state
+- Automatic validation of state transitions
+
+### Execution Context Propagation
+
+The framework uses Node.js AsyncLocalStorage to maintain temporal context throughout the entire execution stack. Every function call automatically knows:
+- Current simulation timestamp (backtest) or real time (live)
+- Trading symbol being processed
+- Strategy and exchange configuration
+- Whether running in backtest or live mode
+
+**Problem Solved:** Manual timestamp passing creates error-prone code where developers accidentally use wrong time references, leading to look-ahead bias or incorrect calculations.
+
+**Key Benefits:**
+- Zero boilerplate for time context
+- Impossible to accidentally use future data
+- Same code works identically in backtest and live modes
+- Automatic synchronization across multiple timeframes
+
+### Crash-Safe Persistence
+
+All state mutations are written atomically to disk before being considered complete. If the process crashes mid-operation, the system recovers to the last consistent state on restart.
+
+**Problem Solved:** Trading systems that crash during position updates often leave corrupted state, causing duplicate trades, missed exits, or phantom positions.
+
+**Key Solved Scenarios:**
+- Process killed during order placement → position state unchanged
+- Network failure during exchange API call → automatic retry on next tick
+- Power outage during state save → recovery from last atomic write
+- Out of memory error → graceful shutdown with state preserved
+
+---
+
+## Signal Lifecycle
+
+### Signal Creation and Validation
+
+Signals are created through the `getSignal` function and undergo comprehensive validation before being accepted:
+
+**Validation Checks:**
+- Take-profit and stop-loss prices are positive
+- TP/SL relationship is correct (TP > entry for long, TP < entry for short)
+- Risk/reward ratio meets minimum thresholds
+- Timestamps are valid and not in the future
+- Signal doesn't violate interval throttling rules
+
+**Problem Solved:** Invalid signals cause undefined behavior, incorrect PnL calculations, and potential financial losses. Validation catches these issues before they reach the execution layer.
+
+### Signal States and Transitions
+
+Signals progress through well-defined states:
+
+1. **Idle:** No active signal, strategy is monitoring
+2. **Scheduled:** Signal created but waiting for entry price
+3. **Pending:** Entry conditions met, waiting for execution
+4. **Opened:** Position established, monitoring for exit
+5. **Active:** Position in profit/loss, trailing stops active
+6. **Closed:** Position exited (take-profit, stop-loss, manual, or timeout)
+
+Each state has specific allowed operations and accessible data. Attempting invalid operations (like modifying a closed position) results in compile-time errors.
+
+### Signal Cancellation and Timeout
+
+Signals can be cancelled before execution due to:
+- User intervention
+- Risk management rejection
+- Timeout (configurable wait period)
+- Conflicting signal generation
+
+Cancelled signals are tracked separately from closed positions, allowing analysis of signal quality and rejection patterns.
+
+---
+
+## Position Management
+
+### Dollar Cost Averaging (DCA)
+
+The framework supports sophisticated DCA strategies with automatic entry tracking:
+
+**Features:**
+- Multiple entry levels with individual cost basis
+- Harmonic mean calculation for effective entry price
+- Automatic rejection of averaging into winning positions (configurable)
+- Partial close history affects future DCA calculations
+
+**Problem Solved:** Manual DCA tracking requires complex bookkeeping. The framework automatically maintains entry history, calculates blended cost basis, and prevents common mistakes like averaging up.
+
+**Key Mechanics:**
+- Each DCA entry records price, cost, and timestamp
+- Effective price recalculates after each entry
+- Partial closes adjust cost basis proportionally
+- Entry overlap detection prevents duplicate entries at similar prices
+
+### Partial Profit and Loss
+
+Positions can be partially closed at profit or loss milestones:
+
+**Capabilities:**
+- Close percentage of position at specific profit levels (10%, 20%, 30%, etc.)
+- Close percentage at loss levels to limit exposure
+- Track remaining cost basis after partial closes
+- Calculate PnL for each partial independently
+
+**Problem Solved:** All-or-nothing exits miss opportunities to lock in gains or limit losses. Partial closes allow fine-grained position management while maintaining exposure.
+
+**Advanced Features:**
+- Partial close history preserved for analysis
+- Remaining position continues with adjusted cost basis
+- PnL calculations account for all partials and remaining position
+- Overlap detection prevents duplicate partials at similar prices
+
+### Trailing Stop and Take Profit
+
+Dynamic adjustment of exit levels based on price movement:
+
+**Trailing Stop:**
+- Stop-loss moves in favorable direction only
+- Configurable distance from current price
+- Automatic adjustment on each tick
+- Prevents stop from moving backward
+
+**Trailing Take:**
+- Take-profit adjusts as price moves favorably
+- Locks in gains while allowing upside
+- Configurable trailing percentage
+- Independent from initial take-profit
+
+**Problem Solved:** Static exit levels either exit too early (missing trends) or too late (giving back gains). Trailing exits adapt to market conditions automatically.
+
+### Breakeven Protection
+
+Automatic adjustment of stop-loss to entry price once position reaches profitability threshold:
+
+**Mechanism:**
+- Calculates threshold to cover fees and slippage
+- Moves stop-loss to entry price when threshold reached
+- Prevents winning trade from becoming loser
+- One-time adjustment per signal
+
+**Problem Solved:** Traders often move stop-loss to breakeven manually, missing the optimal moment or forgetting entirely. Automation ensures protection is applied consistently.
+
+---
+
+## Risk Management
+
+### Portfolio-Level Risk Checks
+
+Risk validation operates across all strategies and symbols simultaneously:
+
+**Capabilities:**
+- Track total number of open positions across portfolio
+- Enforce maximum concurrent position limits
+- Custom validation functions for complex rules
+- Rejection tracking with detailed reasons
+
+**Problem Solved:** Individual strategy risk checks miss portfolio-level exposure. A trader might have 10 strategies each risking 10%, creating 100% total exposure unintentionally.
+
+**Key Features:**
+- Atomic check-and-reserve prevents race conditions
+- Multiple strategies can share same risk profile
+- Rejection events logged for analysis
+- Configurable callbacks for rejection handling
+
+### Custom Validation Rules
+
+Developers define validation functions that receive:
+- Pending signal details (entry, TP, SL, direction)
+- Current market price
+- Active position count
+- Portfolio state
+
+**Common Validations:**
+- Minimum risk/reward ratio
+- Maximum position size
+- Time-of-day restrictions
+- Correlation checks between symbols
+- Volatility filters
+
+**Problem Solved:** Hard-coded risk rules don't adapt to strategy-specific requirements. Custom validators allow arbitrary logic while maintaining framework guarantees.
+
+### Risk Rejection Handling
+
+When a signal violates risk rules:
+- Signal is rejected before execution
+- Rejection reason logged with full context
+- Strategy continues operating normally
+- Rejection statistics tracked for analysis
+
+**Problem Solved:** Silent risk violations lead to unexpected exposure. Explicit rejection with logging provides visibility into risk management effectiveness.
+
+---
+
+## Data Integrity
+
+### Look-Ahead Bias Prevention
+
+The framework enforces strict temporal boundaries to prevent accidental use of future data:
+
+**Mechanisms:**
+- All candle requests aligned to interval boundaries
+- Pending (incomplete) candles excluded from results
+- Timestamp validation on every data access
+- AsyncLocalStorage provides automatic context
+
+**Problem Solved:** Look-ahead bias is the most common cause of unrealistic backtest results. Manual timestamp management inevitably leads to errors.
+
+**Guarantees:**
+- Impossible to request data beyond current simulation time
+- Pending candles never included in calculations
+- Multi-timeframe data automatically synchronized
+- Same code produces identical results in backtest and live
+
+### Candle Timestamp Alignment
+
+All timestamps aligned down to interval boundaries:
+
+**Example:**
+- 15-minute interval
+- Request at 00:17 → aligned to 00:15
+- Request at 00:44 → aligned to 00:30
+
+**Problem Solved:** Misaligned timestamps cause off-by-one errors, duplicate data, or missing candles. Automatic alignment ensures consistency.
+
+**Key Rules:**
+- First candle timestamp equals aligned start time
+- Exactly requested number of candles returned
+- Sequential timestamps with fixed interval
+- Last candle timestamp calculated deterministically
+
+### Order Book and Trade Data
+
+Similar temporal protection for order book and aggregated trades:
+
+**Order Book:**
+- Configurable time offset window
+- Aligned to offset boundaries
+- Adapter receives time range for historical queries
+
+**Aggregated Trades:**
+- Always aligned to 1-minute boundaries
+- Pagination for large requests
+- Automatic slicing to requested limit
+
+**Problem Solved:** Order book data without temporal context leads to using future snapshots. Time windows ensure only historical data accessible.
+
+---
+
+## Persistence and Storage
+
+### Atomic File Writes
+
+Default persistence uses atomic file operations:
+
+**Mechanism:**
+- Write to temporary file
+- Rename to final location (atomic on most filesystems)
+- Verify write completion
+- Recover from incomplete writes on restart
+
+**Problem Solved:** Partial writes during crashes corrupt state files, making recovery impossible. Atomic writes ensure all-or-nothing semantics.
+
+### Pluggable Storage Adapters
+
+Framework supports multiple storage backends through adapter pattern:
+
+**Built-in Adapters:**
+- File-based (default, zero configuration)
+- In-memory (testing, fast iteration)
+- MongoDB (production, scalable)
+- Redis (caching, O(1) lookups)
+
+**Problem Solved:** Different deployment scenarios require different storage strategies. Hard-coded storage limits flexibility and scalability.
+
+**Adapter Capabilities:**
+- 15 separate persistence contracts (signals, candles, logs, etc.)
+- Each adapter implements all contracts
+- Zero strategy code changes when switching backends
+- Automatic adapter selection based on mode
+
+### MongoDB and Redis Integration
+
+Production-grade storage with advanced features:
+
+**MongoDB Features:**
+- Unique compound indexes prevent duplicates
+- Atomic upserts with read-after-write consistency
+- Queryable signal history
+- Survives process restarts
+
+**Redis Features:**
+- O(1) lookups via context-key to ID mapping
+- Cache miss fallback to MongoDB
+- Automatic cache invalidation on writes
+- Eliminates B-tree scans for repeated reads
+
+**Problem Solved:** File-based storage becomes bottleneck at scale. Database backends provide durability, queryability, and performance for production deployments.
+
+### Soft Delete Mechanism
+
+Certain records use soft delete instead of physical deletion:
+
+**Applies To:**
+- Measure data (LLM responses, API results)
+- Interval markers (processed time periods)
+- Memory entries (agent context)
+
+**Mechanism:**
+- Set `removed: true` flag
+- Listing operations filter on `removed: false`
+- Physical file preserved for audit trail
+
+**Problem Solved:** Physical deletion loses audit trail and can cause race conditions. Soft delete preserves history while hiding from active use.
+
+---
+
+## Broker Integration
+
+### Transactional Commits
+
+Every broker operation follows transactional pattern:
+
+**Sequence:**
+1. Framework prepares commit payload
+2. Broker adapter executes exchange operation
+3. If success → internal state updated
+4. If failure → state unchanged, retry on next tick
+
+**Problem Solved:** Exchange failures during position updates cause state desynchronization. Transactional commits ensure framework state matches exchange state.
+
+### Rollback on Failure
+
+When broker adapter throws exception:
+
+**Behavior:**
+- Internal state mutation skipped
+- Position remains in previous state
+- Error logged with full context
+- Automatic retry on next tick
+
+**Problem Solved:** Partial state updates leave system in inconsistent state. Rollback ensures atomicity of position changes.
+
+**Example Scenarios:**
+- Exchange API timeout → retry automatically
+- Insufficient margin → reject and log
+- Network failure → recover when connection restored
+- Exchange rejection → state unchanged, strategy continues
+
+### Retry Mechanism
+
+Failed commits automatically retried:
+
+**Mechanism:**
+- Exception caught by framework
+- State rollback completed
+- Same commit attempted on next tick
+- Continues until success or strategy cancelled
+
+**Problem Solved:** Transient exchange failures shouldn't require manual intervention. Automatic retry handles temporary issues transparently.
+
+**Guarantees:**
+- No duplicate commits (state unchanged until success)
+- No lost commits (retry continues indefinitely)
+- Strategy can cancel pending commit
+- Full audit trail of attempts
+
+### Exchange Rejection Handling
+
+Broker adapters can reject operations:
+
+**Rejection Scenarios:**
+- Insufficient balance
+- Invalid order parameters
+- Exchange-specific restrictions
+- Rate limiting
+
+**Handling:**
+- Adapter throws exception with reason
+- Framework rolls back state
+- Error surfaced to user interface
+- Strategy decides whether to retry or cancel
+
+**Problem Solved:** Silent exchange rejections cause confusion about position state. Explicit rejection with error messages provides clarity.
+
+---
+
+## Reporting and Analytics
+
+### Markdown Reports
+
+Automatic generation of human-readable reports:
+
+**Report Types:**
+- Backtest summary (total PnL, win rate, Sharpe ratio)
+- Signal lifecycle (all state transitions)
+- Risk rejections (all blocked signals)
+- Partial closes (all profit/loss milestones)
+- Maximum drawdown (all peak-to-trough events)
+
+**Problem Solved:** Manual report generation is time-consuming and error-prone. Automatic reports provide instant visibility into strategy performance.
+
+**Features:**
+- Customizable columns
+- Configurable output format (file or JSONL)
+- Organized by symbol, strategy, exchange
+- Searchable and filterable
+
+### JSONL Logging
+
+Machine-readable logs for programmatic analysis:
+
+**Capabilities:**
+- Incremental writes (one event per line)
+- Metadata included (symbol, strategy, timestamp)
+- Searchable by multiple criteria
+- Append-only (no overwrites)
+
+**Problem Solved:** Binary log formats require custom parsers. JSONL provides human-readable, tool-friendly format for analysis.
+
+**Use Cases:**
+- Post-trade analysis
+- Strategy optimization
+- Anomaly detection
+- Compliance auditing
+
+### Performance Metrics
+
+Comprehensive calculation of trading metrics:
+
+**Metrics Calculated:**
+- Total PnL (absolute and percentage)
+- Win rate and loss rate
+- Average win and loss size
+- Sharpe ratio (risk-adjusted returns)
+- Sortino ratio (downside risk-adjusted)
+- Maximum drawdown (peak-to-trough decline)
+- Recovery factor (profit / max drawdown)
+- Expectancy (average profit per trade)
+
+**Problem Solved:** Manual metric calculation is error-prone and incomplete. Built-in calculations ensure accuracy and consistency.
+
+**Advanced Features:**
+- Pooled metrics across multiple symbols
+- Time-weighted returns
+- Consecutive win/loss streaks
+- Buyer/seller pressure analysis
+- Trend classification with confidence
+
+### Heatmap Visualization
+
+Portfolio-wide performance visualization:
+
+**Features:**
+- Performance by symbol
+- Cross-strategy comparison
+- Risk-adjusted metrics
+- Time-period analysis
+
+**Problem Solved:** Tabular reports don't reveal patterns across symbols. Heatmaps provide instant visual identification of strengths and weaknesses.
+
+---
+
+## AI and LLM Integration
+
+### Memory Adapters
+
+Persistent storage for LLM context and reasoning:
+
+**Capabilities:**
+- Store conversation history per signal
+- Search memory using BM25 algorithm
+- List all memories up to timestamp
+- Soft delete for audit trail
+
+**Problem Solved:** LLM context lost between sessions prevents learning and continuity. Memory adapters preserve reasoning across restarts.
+
+**Use Cases:**
+- Store LLM reasoning for each trade
+- Retrieve relevant past decisions
+- Build knowledge base over time
+- Debug LLM decision-making
+
+### Session Management
+
+Temporary storage for calculations and intermediate results:
+
+**Features:**
+- Scoped to symbol, strategy, exchange, timeframe
+- Automatic cleanup on signal close
+- Persistent across process restarts
+- Prevents look-ahead bias
+
+**Problem Solved:** Complex calculations repeated on every tick waste resources. Session storage caches results while maintaining temporal correctness.
+
+**Example Scenarios:**
+- Cache indicator calculations
+- Store LLM inference results
+- Maintain running statistics
+- Track signal-specific metrics
+
+### Agent Answer Dumping
+
+Complete preservation of LLM interactions:
+
+**Capabilities:**
+- Store full conversation history
+- Include system prompts and tool calls
+- Attach to specific trading signals
+- Searchable and exportable
+
+**Problem Solved:** LLM decisions are opaque without full context. Complete conversation dumps enable debugging and improvement.
+
+**Features:**
+- Messages with roles (system, user, assistant, tool)
+- Reasoning content preserved
+- Tool call details included
+- Images and attachments supported
+
+### Multi-Provider Support
+
+Unified interface for multiple LLM providers:
+
+**Supported Providers:**
+- OpenAI, Claude, DeepSeek, Grok
+- Mistral, Perplexity, Cohere, Alibaba
+- Hugging Face, Ollama (local)
+
+**Features:**
+- Automatic API key rotation
+- Structured output enforcement
+- Trading-specific prompts
+- Fallback chains
+
+**Problem Solved:** Different LLM providers have incompatible APIs. Unified interface allows easy switching and comparison.
+
+---
+
+## Developer Tools
+
+### Command-Line Interface
+
+Zero-boilerplate execution of strategies:
+
+**Modes:**
+- `--backtest`: Historical simulation
+- `--paper`: Live prices, no real orders
+- `--live`: Real trading with exchange
+- `--walker`: A/B strategy comparison
+
+**Features:**
+- Automatic candle caching
+- Web dashboard integration
+- Telegram notifications
+- Graceful shutdown on SIGINT
+
+**Problem Solved:** Manual setup for each mode requires significant boilerplate. CLI provides one-command execution with all infrastructure handled.
+
+### Web Dashboard
+
+Real-time monitoring and manual control:
+
+**Pages:**
+- Main overview (all strategies and symbols)
+- Signal status (pending, active, closed)
+- Manual control (open, close, average, breakeven)
+- Pine Script editor (interactive development)
+
+**Problem Solved:** Console-only monitoring lacks visibility. Web dashboard provides real-time insights and manual intervention capabilities.
+
+**Features:**
+- Live signal updates
+- Multi-timeframe charts
+- Risk rejection tracking
+- Position management buttons
+
+### Telegram Notifications
+
+Formatted alerts for trading events:
+
+**Notifications:**
+- Signal opened/closed
+- Partial profit/loss
+- Risk rejections
+- Breakeven reached
+- Trailing adjustments
+
+**Problem Solved:** Missing trading events due to lack of monitoring. Telegram alerts ensure immediate awareness of important events.
+
+**Features:**
+- Price charts included
+- Customizable templates
+- Filter by event type
+- HTML formatting
+
+### Docker Support
+
+Containerized deployment with automatic restarts:
+
+**Capabilities:**
+- Pre-configured docker-compose
+- Environment variable configuration
+- Automatic container restart
+- Zero-downtime updates
+
+**Problem Solved:** Manual deployment and process management is error-prone. Docker provides consistent, reliable execution environment.
+
+**Features:**
+- Separate containers for app, MongoDB, Redis
+- Configurable via environment variables
+- Health checks and restart policies
+- Log aggregation
+
+---
+
+## Advanced Features
+
+### Walker (A/B Testing)
+
+Systematic comparison of multiple strategies:
+
+**Workflow:**
+1. Define multiple strategy variants
+2. Run all on same historical data
+3. Calculate metrics for each
+4. Rank by optimization criterion
+5. Generate comparison report
+
+**Problem Solved:** Manual strategy comparison is time-consuming and inconsistent. Walker automates the entire process with statistical rigor.
+
+**Features:**
+- Configurable optimization metric (Sharpe, PnL, etc.)
+- Progress tracking during execution
+- Markdown comparison reports
+- JSON export for further analysis
+
+### Cron Scheduler
+
+Periodic and fire-once job execution:
+
+**Capabilities:**
+- Periodic jobs (every hour, daily, etc.)
+- Fire-once jobs (single execution)
+- Symbol-specific or global scope
+- Coordination across parallel backtests
+
+**Problem Solved:** Manual scheduling leads to missed executions or duplicate runs. Cron ensures reliable, coordinated job execution.
+
+**Features:**
+- Virtual time alignment (backtest mode)
+- Automatic retry on failure
+- Generation tracking for re-registrations
+- Mutex semantics for parallel execution
+
+**Example Use Cases:**
+- Fetch funding rates hourly
+- Parse Telegram signals every 15 minutes
+- Warm cache on startup
+- Daily portfolio rebalancing
+
+### Pine Script Support
+
+Run TradingView indicators directly in Node.js:
+
+**Features:**
+- Pine Script v5/v6 compatibility
+- 60+ built-in indicators
+- File or code string input
+- Plot extraction to signals
+
+**Problem Solved:** Rewriting Pine Script indicators in JavaScript is time-consuming. Direct execution preserves existing work.
+
+**Capabilities:**
+- Native TradingView syntax
+- Automatic indicator calculation
+- Flexible signal mapping
+- Cached execution for performance
+
+### Multi-Timeframe Analysis
+
+Synchronized data across multiple intervals:
+
+**Mechanism:**
+- Automatic alignment of all timeframes
+- Consistent temporal boundaries
+- No look-ahead bias possible
+- Same code for all timeframes
+
+**Problem Solved:** Manual multi-timeframe synchronization is error-prone. Automatic alignment ensures consistency.
+
+**Supported Intervals:**
+- 1m, 3m, 5m, 15m, 30m
+- 1h, 2h, 4h, 6h, 8h
+- 12h, 1d, 3d, 1w, 1M
+
+---
+
+## Performance Optimization
+
+### Async Generators
+
+Memory-efficient streaming for large datasets:
+
+**Benefits:**
+- No array accumulation
+- Early termination support
+- Constant memory usage
+- Backpressure handling
+
+**Problem Solved:** Loading entire history into memory causes out-of-memory errors. Streaming allows processing unlimited data.
+
+**Use Cases:**
+- Year-long backtests on 1-minute data
+- Multi-symbol parallel execution
+- Real-time signal processing
+- Large portfolio analysis
+
+### Memoization
+
+Cache expensive calculations automatically:
+
+**Capabilities:**
+- Client instances cached by schema name
+- Validation results memoized
+- Connection reuse
+- Time-based cache invalidation
+
+**Problem Solved:** Repeated calculations waste CPU cycles. Memoization eliminates redundant work.
+
+**Features:**
+- Automatic cache key generation
+- Configurable TTL
+- Manual cache clearing
+- Memory-efficient storage
+
+### Prototype Methods
+
+Memory-efficient method definitions:
+
+**Mechanism:**
+- Methods defined on prototype, not instances
+- Shared across all instances of class
+- Reduced memory footprint
+- Faster instantiation
+
+**Problem Solved:** Arrow functions in constructors create new function per instance. Prototype methods share single function across all instances.
+
+**Impact:**
+- 50-70% memory reduction for large object collections
+- Faster garbage collection
+- Better CPU cache utilization
+
+### Bounded Queues
+
+Prevent memory leaks from unbounded event accumulation:
+
+**Mechanism:**
+- Maximum queue size enforced
+- Oldest events dropped when full
+- Backpressure signals to producers
+- Graceful degradation under load
+
+**Problem Solved:** Unbounded queues grow indefinitely during high event rates, causing out-of-memory crashes. Bounded queues maintain stability.
+
+**Configuration:**
+- Configurable maximum size
+- Drop policy (oldest, newest, etc.)
+- Monitoring of queue depth
+- Alerts on threshold breach
+
+---
+
+## Architecture
+
+### Clean Architecture Layers
+
+Strict separation of concerns:
+
+**Client Layer:**
+- Pure business logic
+- No dependency injection
+- Prototype methods for efficiency
+- Direct data manipulation
+
+**Service Layer:**
+- Dependency injection container
+- Organized by responsibility
+- Schema, validation, connection services
+- Global wrappers for public API
+
+**Persistence Layer:**
+- Atomic file operations
+- Pluggable adapters
+- Crash-safe writes
+- Recovery mechanisms
+
+**Event Layer:**
+- Subject-based emitters
+- Queued async processing
+- Filter predicates
+- Once listeners
+
+**Problem Solved:** Monolithic architecture makes testing and modification difficult. Layered architecture enables independent development and testing.
+
+### Dependency Injection
+
+Custom DI container with Symbol-based tokens:
+
+**Features:**
+- Type-safe injection
+- Lazy instantiation
+- Scope management
+- Test-friendly mocking
+
+**Problem Solved:** Hard-coded dependencies prevent testing and flexibility. DI enables easy substitution and testing.
+
+**Benefits:**
+- Easy mocking for tests
+- Flexible configuration
+- Clear dependency graph
+- Reduced coupling
+
+### Context Propagation
+
+Nested contexts using scoped services:
+
+**Contexts:**
+- ExecutionContext (symbol, timestamp, mode)
+- MethodContext (strategy, exchange, frame)
+- Automatic propagation through async calls
+
+**Problem Solved:** Manual context passing creates verbose, error-prone code. Automatic propagation ensures correct context everywhere.
+
+**Mechanism:**
+- AsyncLocalStorage for execution context
+- DI scopes for method context
+- Automatic inheritance
+- Isolation between parallel executions
+
+### Registry Pattern
+
+Centralized configuration management:
+
+**Registries:**
+- Strategy schemas
+- Exchange schemas
+- Frame schemas
+- Risk schemas
+- Sizing schemas
+
+**Problem Solved:** Scattered configuration makes validation and discovery difficult. Centralized registries provide single source of truth.
+
+**Features:**
+- Type-safe registration
+- Shallow validation on add
+- Runtime existence checks
+- Memoized validation results
+
+---
+
+## Testing and Reliability
+
+### Comprehensive Test Coverage
+
+775+ unit and integration tests:
+
+**Test Categories:**
+- Exchange helper functions
+- Event listener system
+- Signal validation logic
+- PnL calculation accuracy
+- Signal lifecycle verification
+- Strategy callbacks
+- Report generation
+
+**Problem Solved:** Untested trading systems contain hidden bugs that cause financial losses. Comprehensive testing ensures reliability.
+
+**Testing Patterns:**
+- Unique names per test (prevent cross-contamination)
+- Mock candle generators
+- Async coordination utilities
+- Background execution with event detection
+
+### Validation Services
+
+Runtime validation with memoization:
+
+**Validations:**
+- Strategy existence and configuration
+- Exchange schema correctness
+- Frame definition validity
+- Risk profile completeness
+- Sizing method parameters
+
+**Problem Solved:** Invalid configurations cause runtime errors or incorrect behavior. Validation catches issues before execution.
+
+**Features:**
+- Shallow validation on registration
+- Deep validation before execution
+- Memoized results (performance)
+- Clear error messages
+
+### Error Handling
+
+Graceful degradation on failures:
+
+**Strategies:**
+- ActionProxy wraps all handlers
+- Errors logged, execution continues
+- Rollback on state mutations
+- Automatic retry on transient failures
+
+**Problem Solved:** Unhandled exceptions crash trading systems. Graceful error handling maintains operation through failures.
+
+**Mechanisms:**
+- Try-catch at every boundary
+- Error events for monitoring
+- State rollback on failure
+- Retry with backoff
+
+---
+
+## Deployment Scenarios
+
+### Single Strategy Development
+
+Quick iteration on individual strategies:
+
+**Workflow:**
+1. Create strategy file
+2. Run backtest with CLI
+3. Analyze reports
+4. Iterate on logic
+5. Deploy to paper trading
+6. Move to live when validated
+
+**Problem Solved:** Complex setup slows development. Simple workflow enables rapid iteration.
+
+### Multi-Strategy Monorepo
+
+Manage multiple strategies in single repository:
+
+**Structure:**
+- Shared packages (brokers, signals, utilities)
+- Individual strategy directories
+- Isolated resources per strategy
+- Shared infrastructure (MongoDB, Redis)
+
+**Problem Solved:** Separate repositories for each strategy create maintenance burden. Monorepo enables code sharing and consistent tooling.
+
+**Features:**
+- Automatic import aliases
+- Per-strategy environment variables
+- Isolated dump directories
+- Shared broker adapters
+
+### Parallel Symbol Execution
+
+Run same strategy across multiple symbols simultaneously:
+
+**Capabilities:**
+- Single Node.js process
+- Shared event loop
+- Common infrastructure
+- Independent state per symbol
+
+**Problem Solved:** Separate processes for each symbol waste resources. Parallel execution maximizes hardware utilization.
+
+**Performance:**
+- ~6,300× real-time aggregate speed
+- ~703× per-symbol replay speed
+- ~103 events/second in hot loops
+- Constant memory usage
+
+### Production Deployment
+
+Reliable live trading with monitoring:
+
+**Components:**
+- Docker containers for isolation
+- MongoDB for persistence
+- Redis for caching
+- Web dashboard for monitoring
+- Telegram for alerts
+
+**Problem Solved:** Ad-hoc deployments are unreliable. Structured deployment ensures stability and observability.
+
+**Features:**
+- Automatic restart on failure
+- Health checks and monitoring
+- Log aggregation
+- Zero-downtime updates
+
+---
+
+## Common Patterns
+
+### Signal Generation
+
+Typical signal generation workflow:
+
+1. Fetch multi-timeframe data
+2. Calculate indicators
+3. Apply entry logic
+4. Validate signal parameters
+5. Return signal or null
+
+**Best Practices:**
+- Use framework data fetching (prevents look-ahead bias)
+- Validate all parameters before return
+- Include descriptive notes
+- Handle errors gracefully
+
+### Position Management
+
+Common position management patterns:
+
+**Partial Profit:**
+- Close percentage at profit milestones
+- Lock in gains while maintaining exposure
+- Adjust remaining cost basis
+
+**DCA Entry:**
+- Add to position on favorable moves
+- Track multiple entry levels
+- Calculate blended entry price
+
+**Trailing Exit:**
+- Adjust stop/take as price moves
+- Lock in gains dynamically
+- Prevent giving back profits
+
+### Risk Management
+
+Typical risk management setup:
+
+1. Define risk profile with validations
+2. Attach profile to strategy
+3. Framework checks before every signal
+4. Rejections logged automatically
+5. Statistics available for analysis
+
+**Common Validations:**
+- Minimum risk/reward ratio
+- Maximum position size
+- Time-of-day restrictions
+- Volatility filters
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**Look-Ahead Bias:**
+- Symptom: Unrealistic backtest results
+- Cause: Using future data accidentally
+- Solution: Use framework data fetching functions
+
+**State Desynchronization:**
+- Symptom: Framework state doesn't match exchange
+- Cause: Exchange failure during state update
+- Solution: Use transactional broker commits
+
+**Memory Leaks:**
+- Symptom: Increasing memory usage over time
+- Cause: Unbounded event accumulation
+- Solution: Use bounded queues, dispose resources
+
+**Performance Degradation:**
+- Symptom: Slow execution over time
+- Cause: Repeated expensive calculations
+- Solution: Use memoization, cache results
+
+### Debugging Techniques
+
+**Enable Verbose Logging:**
+- Set log level to debug
+- Review all state transitions
+- Check validation errors
+
+**Use Web Dashboard:**
+- Monitor signals in real-time
+- Inspect position details
+- Trigger manual operations
+
+**Analyze Reports:**
+- Review Markdown reports
+- Check JSONL logs
+- Examine heatmap visualizations
+
+---
+
+## Migration Guide
+
+### From Other Frameworks
+
+**Key Differences:**
+- Strict state machine (no ambiguous states)
+- Automatic temporal context (no manual timestamps)
+- Transactional commits (no partial updates)
+- Comprehensive validation (no invalid signals)
+
+**Migration Steps:**
+1. Identify signal generation logic
+2. Map to `getSignal` function
+3. Configure risk management
+4. Set up broker adapter
+5. Test in paper mode
+6. Deploy to live
+
+**Benefits:**
+- Eliminate state corruption bugs
+- Prevent look-ahead bias
+- Ensure exchange synchronization
+- Improve code maintainability
+
+---
+
+## Conclusion
+
+Backtest Kit solves the fundamental challenges of building reliable trading systems through:
+
+- **Type-safe state machines** that eliminate state corruption
+- **Automatic temporal context** that prevents look-ahead bias
+- **Transactional commits** that ensure exchange synchronization
+- **Comprehensive validation** that catches errors before execution
+- **Pluggable architecture** that adapts to different deployment scenarios
+- **Production-grade persistence** that survives crashes and restarts
+
+The framework is battle-tested through 775+ tests, real-world trading deployments, and continuous iteration based on user feedback. It provides the reliability and correctness required for production trading while maintaining the flexibility needed for strategy research and development.
+
+Whether building a single strategy or a multi-symbol trading desk, Backtest Kit provides the tools and guarantees needed to move from research to production with confidence.
