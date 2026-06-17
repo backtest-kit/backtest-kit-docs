@@ -1067,6 +1067,149 @@ Typical risk management setup:
 
 ---
 
+## Learning Curve: A "Fool-Proof" Architecture
+
+```typescript
+import {
+  addStrategySchema,
+  listenError,
+  listenActivePing,
+  Log,
+  Position,
+  commitClosePending,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+  commitAverageBuy,
+} from "backtest-kit";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+const HARD_STOP = 25.0;
+const TARGET_PROFIT = 3;
+
+const LADDER_STEP_COST = 100;
+const LADDER_UPPER_STEP = 5;
+const LADDER_LOWER_STEP = 1;
+
+const LADDER_MAX_STEPS = 10;
+
+addStrategySchema({
+  strategyName: "apr_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: "long",
+      ...Position.moonbag({
+        position: "long",
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: LADDER_STEP_COST,
+    };
+  },
+});
+
+listenActivePing(async ({ symbol, currentPrice }) => {
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) {
+    return;
+  }
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) {
+    return;
+  }
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  console.log(new Date(timestamp));
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) {
+    return;
+  }
+  Log.info("position closed due to the target pnl reached", {
+    symbol,
+    data,
+  });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: str.newline(
+      "# Closed by target pnl",
+    ),
+  });
+});
+
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+A common critique of trading frameworks is their steep learning curve and the ease with which a developer can introduce catastrophic bugs. Backtest Kit is intentionally designed with a **"fool-proof" API surface**. It restricts dangerous primitives and forces the developer into the "pit of success," making it practically impossible to shoot yourself in the foot.
+
+### 1. Ambient Temporal Context (No More Manual Time Passing)
+In traditional frameworks, you must manually pass the `currentDate` or `timestamp` through every function call. If you miss a parameter, you accidentally leak future data into your indicators, ruining the backtest. 
+Backtest Kit uses Node.js `AsyncLocalStorage` to create an **ambient execution context**. When you request candles or order book data, the engine automatically knows exactly what "now" is. You cannot accidentally query future data because the engine physically blocks it at the adapter level.
+
+### 2. Type-Safe State Machines
+Trading signals have a strict lifecycle: *Idle → Scheduled → Pending → Opened → Active → Closed*. 
+Using TypeScript's Discriminated Unions, the framework makes invalid states unrepresentable. You cannot accidentally call a `closePosition` method on a signal that is already closed, nor can you modify the entry price of an active trade. The compiler enforces the lifecycle, eliminating entire classes of runtime state-corruption bugs.
+
+### 3. Guarded Dollar-Cost Averaging (DCA)
+Manually implementing DCA is a mathematical nightmare. Developers often accidentally "average up" (buying at a higher price than the current effective entry), which destroys the position's profitability. Backtest Kit's DCA engine uses a **harmonic mean** calculation and physically rejects any `commitAverageBuy` call that would worsen the effective entry price. 
+
+### 4. Transactional Broker Commits (The "No-Try-Catch" Rule)
+In live trading, if the exchange rejects an order (e.g., insufficient margin, rate limit), your internal bot state and the exchange state become desynchronized. Usually, developers write complex `try/catch` blocks to manually roll back variables. 
+In Backtest Kit, **the broker adapter intercepts every mutation before the internal state changes**. If the exchange throws an error, the framework automatically rolls back the internal state and retries on the next tick. You never have to write rollback logic.
+
+### 5. Automatic Signal Validation
+Before a signal even reaches the execution engine, it passes through a rigorous validation pipeline. The framework checks if Take-Profit (TP) and Stop-Loss (SL) prices are logically sound, if the Risk/Reward ratio meets your criteria, and if the signal violates any interval throttling rules. Invalid signals are rejected silently or logged, preventing them from crashing the strategy.
+
+---
+
+## How Backtest Kit Compares to the Competition
+
+Most trading frameworks force you to choose between research speed and production reliability. Backtest Kit bridges this gap by providing a unified engine that handles everything from historical simulation to live execution. Here is how it stacks up against the industry standards.
+
+### vs. Backtrader (Python)
+**The Paradigm Shift: From Fragile Scripts to Type-Safe Systems**
+Backtrader is the grandfather of Python backtesting, but it relies heavily on dynamic typing and global state. This makes it notoriously easy to introduce look-ahead bias or state corruption, as the framework rarely stops you from making logical errors. 
+* **The Backtest Kit Advantage:** Backtest Kit enforces a strict, type-safe state machine (`idle → opened → active → closed`) using TypeScript's discriminated unions. The compiler physically prevents you from accessing closed position data or modifying an active trade as if it were closed. Furthermore, Backtest Kit's ambient temporal context automatically blocks look-ahead bias at the adapter level.
+
+### vs. VectorBT (Python)
+**The Paradigm Shift: From Static Simulation to Live Execution**
+VectorBT is incredibly fast for matrix-based, single-pass historical simulations. However, it is fundamentally a research tool. It lacks a built-in execution engine for live trading, meaning you have to build a completely separate, custom system to actually deploy your strategy to an exchange.
+* **The Backtest Kit Advantage:** Backtest Kit is not just a simulator; it is a unified execution engine. The exact same code that runs a historical backtest can be deployed to live trading with a single configuration change. Its crash-safe persistence, atomic file writes, and transactional broker commits ensure that your live bot can recover from network failures or process crashes without losing track of open positions.
+
+### vs. MetaTrader / MQL5
+**The Paradigm Shift: From Platform Lock-in to a Modern, Open Stack**
+MetaTrader is a closed ecosystem. MQL5 is a legacy language, and your strategies are trapped inside a Windows-centric desktop application. Integrating with modern data sources, AI models, or custom REST/WebSocket APIs requires painful workarounds and external bridges.
+* **The Backtest Kit Advantage:** Backtest Kit is built on a modern, open-source stack (Node.js/TypeScript). You own the entire infrastructure. You can seamlessly integrate local LLMs (like Ollama), fetch data from any custom API, or deploy your bot in a Docker container on a Linux server. There is no vendor lock-in, no platform fees, and no reliance on a proprietary desktop GUI.
+
+### vs. QuantConnect / Lean (C#)
+**The Paradigm Shift: From Cloud Dependency to Self-Hosted Sovereignty**
+QuantConnect (and its open-source Lean engine) is powerful, but it heavily pushes you toward their cloud infrastructure and data ecosystem. C# adds compilation overhead, and debugging complex multi-timeframe strategies in a web IDE can be frustrating.
+* **The Backtest Kit Advantage:** Backtest Kit is 100% self-hosted and has zero dependencies on third-party cloud platforms. Your code, your data, and your execution environment stay entirely on your own machines. The TypeScript ecosystem allows for rapid iteration without compilation steps, and the built-in Web UI, CLI, and Telegram notifications provide a superior, modern developer experience for debugging and monitoring live bots.
+
+### vs. Freqtrade (Python)
+**The Paradigm Shift: From Simple Grids to Complex Position Management**
+Freqtrade is an excellent open-source crypto trading bot, but its strategy logic is relatively flat. It excels at simple entry/exit signals but struggles with complex, multi-layered position management.
+* **The Backtest Kit Advantage:** Backtest Kit treats position management as a first-class citizen. It natively supports complex Dollar-Cost Averaging (DCA) ladders, partial profit/loss taking, trailing stops, and breakeven protection—all with mathematically accurate cost-basis tracking. If your strategy requires dynamically adjusting a position over time rather than just "buying and holding until a stop-loss hits," Backtest Kit provides the enterprise-grade math to handle it flawlessly.
+
+### The Bottom Line
+If you are building a quick research prototype or running a simple moving-average crossover in Python, tools like VectorBT or Backtrader are hard to beat for raw speed. 
+
+But the moment you need to **deploy a strategy to production**, manage **complex position sizing**, integrate **AI agents**, or guarantee that a **network outage won't desync your bot from the exchange**, Backtest Kit provides the architectural guardrails that legacy frameworks simply do not have. It is the bridge between a Jupyter Notebook experiment and a resilient, commercial-grade trading desk.
+
+---
+
 ## Troubleshooting
 
 ### Common Issues
