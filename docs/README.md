@@ -1,0 +1,2007 @@
+<img src="https://github.com/tripolskypetr/backtest-kit/raw/refs/heads/master/assets/consciousness.svg" height="45px" align="right">
+
+# 🧿 Backtest Kit
+
+> A TypeScript framework for backtesting and live trading strategies on multi-asset, crypto, forex or [DEX (peer-to-peer marketplace)](https://en.wikipedia.org/wiki/Decentralized_finance#Decentralized_exchanges), spot, futures with crash-safe persistence, signal validation, and AI optimization.
+
+![screenshot](https://raw.githubusercontent.com/tripolskypetr/backtest-kit/HEAD/assets/screenshots/screenshot16.png)
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tripolskypetr/backtest-kit)
+[![npm](https://img.shields.io/npm/v/backtest-kit.svg?style=flat-square)](https://npmjs.org/package/backtest-kit)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)]()
+[![Build](https://github.com/tripolskypetr/backtest-kit/actions/workflows/webpack.yml/badge.svg)](https://github.com/tripolskypetr/backtest-kit/actions/workflows/webpack.yml)
+
+Build reliable trading systems: backtest on historical data, deploy live bots with recovery, and optimize strategies using LLMs like Ollama.
+
+📚 **[API Reference](https://backtest-kit.github.io/documents/example_02_first_backtest.html)** | 🌟 **[Quick Start](https://github.com/tripolskypetr/backtest-kit/tree/master/example)** | **📰 [Article](https://backtest-kit.github.io/documents/article_07_ai_news_trading_signals.html)**
+
+## 🚀 Quick Start
+
+> **New to backtest-kit?** The fastest way to get a real, production-ready setup is to clone the [reference implementation](https://github.com/tripolskypetr/backtest-kit/tree/master/example) — a fully working news-sentiment AI trading system with LLM forecasting, multi-timeframe data, and a documented February 2026 backtest. Start there instead of from scratch.
+
+### 🎯 The Casual Way: CLI Init
+
+> **Minimal scaffold — all boilerplate stays inside `@backtest-kit/cli`:**
+
+```bash
+npx @backtest-kit/cli --init --output backtest-kit-project
+cd backtest-kit-project
+npm install
+npm start
+```
+
+The generated project contains only your strategy files. There is no bootstrap, exchange registration, or runner code to maintain — all of that lives inside `@backtest-kit/cli` and is invoked via `npm start`. Library documentation is fetched automatically into `docs/lib/` on init.
+
+### 🏗️ Alternative: Sidekick CLI
+
+> **Full-control scaffold — all wiring is in your project files:**
+
+```bash
+npx -y @backtest-kit/sidekick my-trading-bot
+cd my-trading-bot
+npm start
+```
+
+Sidekick generates a project where the exchange adapter, frame definitions, risk rules, strategy logic, and runner script all live as editable source files inside the project. Use it when you need full visibility and control over every part of the setup.
+
+### 🐳 Running in Docker
+
+> **Automatic restarts — Zero-downtime trading:**
+
+```bash
+npx @backtest-kit/cli --docker
+cd backtest-kit-docker
+MODE=live SYMBOL=TRXUSDT STRATEGY_FILE=./content/feb_2026/feb_2026.strategy.ts docker-compose up -d
+docker-compose logs -f
+```
+
+CLI can create a ready-to-use Docker workspace: self-contained directory with `docker-compose.yaml` and a strategy entry point. CLI supports [Multiple Symbol in Parallel](https://www.npmjs.com/package/@backtest-kit/cli#-multiple-symbol-parallel) for powerusers.
+
+### 📦 Manual Installation
+
+> **Want to see the code?** 👉 [Demo app](https://github.com/tripolskypetr/backtest-kit/tree/master/example) 👈
+
+```bash
+npm install backtest-kit ccxt ollama uuid
+```
+
+Install the core library and peer dependencies manually. Use this approach when integrating backtest-kit into an existing project or when you need full control over your package setup.
+
+## ✨ Why Choose Backtest Kit?
+
+- 🚀 **Production-Ready**: Seamless switch between backtest/live modes; identical code across environments.
+- 💾 **Crash-Safe**: Atomic persistence recovers states after crashes, preventing duplicates or losses.
+- ✅ **Validation**: Checks signals for TP/SL logic, risk/reward ratios, whipsaw protection and portfolio limits.
+- 🔄 **Efficient Execution**: Streaming architecture for large datasets; VWAP pricing for realism.
+- 🚪 **Path-aware Exit**: Exit based on OHLC replay, not close-to-close
+- 🤖 **AI Integration**: LLM-powered strategy generation (Optimizer) with multi-timeframe analysis.
+- 📊 **Reports & Metrics**: Auto Markdown reports with PNL, Sharpe Ratio, win rate, and more.
+- 📐 **Portfolio Heatmap**: Cross-symbol portfolio with Pooled Sharpe, Sortino & Calmar Ratio, Recovery Factor, Expectancy and other measures
+- 🛡️ **Risk Management**: Custom rules for position limits, time windows, and multi-strategy coordination.
+- 🔌 **Pluggable**: Custom data sources (CCXT), persistence (file/Redis), and sizing calculators.
+- 🗃️ **Transactional Live Orders**: Broker adapter intercepts every trade mutation before internal state changes — exchange rejection rolls back the operation atomically.
+- ⏰ **Built-in Crontab**: Register periodic or fire-once jobs that fire on virtual-time boundaries with singleshot coordination across parallel backtests — one handler invocation per boundary, no double-fires.
+- 🧪 **Tested**: 775+ unit/integration tests for validation, recovery, and events.
+- 🔓 **Self hosted**: Zero dependency on third-party node_modules or platforms; run entirely in your own environment.
+
+## 📋 Supported Order Types
+
+> With the calculation of PnL, Peak Profit and Max Drawdown for each Entry
+
+- Market/Limit entries
+- TP/SL/OCO exits
+- Grid with auto-cancel on unmet conditions
+- Partial profit/loss levels
+- Trailing take-profit / stop-loss
+- Breakeven protection
+- Stop limit entries (before OCO)
+- Dollar cost averaging
+- Time attack / Infinite hold
+
+## 📚 Code Samples
+
+### ⚙️ Basic Configuration
+```typescript
+import { setLogger, setConfig } from 'backtest-kit';
+
+// Enable logging
+setLogger({
+  log: console.log,
+  debug: console.debug,
+  info: console.info,
+  warn: console.warn,
+});
+
+// Global config (optional)
+setConfig({
+  CC_PERCENT_SLIPPAGE: 0.1,  // % slippage
+  CC_PERCENT_FEE: 0.1,       // % fee
+  CC_SCHEDULE_AWAIT_MINUTES: 120,  // Pending signal timeout
+});
+```
+
+### 🔧 Register Components
+```typescript
+import ccxt from 'ccxt';
+import { addExchangeSchema, addStrategySchema, addFrameSchema, addRiskSchema } from 'backtest-kit';
+
+// Exchange (data source)
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({ timestamp, open, high, low, close, volume }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+// Risk profile
+addRiskSchema({
+  riskName: 'demo',
+  validations: [
+    // TP at least 1%
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, position } = pendingSignal;
+      const tpDistance = position === 'long' ? ((priceTakeProfit - priceOpen) / priceOpen) * 100 : ((priceOpen - priceTakeProfit) / priceOpen) * 100;
+      if (tpDistance < 1) throw new Error(`TP too close: ${tpDistance.toFixed(2)}%`);
+    },
+    // R/R at least 2:1
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+      const reward = position === 'long' ? priceTakeProfit - priceOpen : priceOpen - priceTakeProfit;
+      const risk = position === 'long' ? priceOpen - priceStopLoss : priceStopLoss - priceOpen;
+      if (reward / risk < 2) throw new Error('Poor R/R ratio');
+    },
+  ],
+});
+
+// Time frame
+addFrameSchema({
+  frameName: '1d-test',
+  interval: '1m',
+  startDate: new Date('2025-12-01'),
+  endDate: new Date('2025-12-02'),
+});
+```
+
+### 💡 Example Strategy (with LLM)
+```typescript
+import { v4 as uuid } from 'uuid';
+import { addStrategySchema, getCandles, dumpAgentAnswer, dumpRecord } from 'backtest-kit';
+import { json } from './utils/json.mjs';  // LLM wrapper
+import { getMessages } from './utils/messages.mjs';  // Market data prep
+
+addStrategySchema({
+  strategyName: 'llm-strategy',
+  interval: '5m',
+  riskName: 'demo',
+  getSignal: async (symbol) => {
+
+    const candles1h = await getCandles(symbol, "1h", 24);
+    const candles15m = await getCandles(symbol, "15m", 48);
+    const candles5m = await getCandles(symbol, "5m", 60);
+    const candles1m = await getCandles(symbol, "1m", 60);
+
+    const messages = await getMessages(symbol, {
+      candles1h,
+      candles15m,
+      candles5m,
+      candles1m,
+    });  // Calculate indicators / Fetch news
+
+    const resultId = uuid();
+    const signal = await json(messages);  // LLM generates signal
+
+    await dumpAgentAnswer({
+      dumpId: "position-context",
+      bucketName: "multi-timeframe-strategy",
+      messages: messages,  // pass saved messages here
+      description: "agent reasoning for this signal",
+    });
+
+    await dumpRecord({
+      dumpId: "position-entry",
+      bucketName: "multi-timeframe-strategy",
+      record: signal,  // pass saved signal record here
+      description: "signal entry parameters",
+    });
+
+    return { ...signal, id: resultId };
+  },
+});
+```
+
+### 🧪 Run Backtest
+```typescript
+import { Backtest, listenSignalBacktest, listenDoneBacktest } from 'backtest-kit';
+
+Backtest.background('BTCUSDT', {
+  strategyName: 'llm-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+});
+
+listenSignalBacktest((event) => console.log(event));
+listenDoneBacktest(async (event) => {
+  await Backtest.dump(event.symbol, event.strategyName);  // Generate report
+});
+```
+
+### 📈 Run Live Trading
+```typescript
+import { Live, listenSignalLive } from 'backtest-kit';
+
+Live.background('BTCUSDT', {
+  strategyName: 'llm-strategy',
+  exchangeName: 'binance',  // Use API keys in .env
+});
+
+listenSignalLive((event) => console.log(event));
+```
+
+### 📡 Monitoring & Events
+
+- Use `listenRisk`, `listenError`, `listenPartialProfit/Loss` for alerts.
+- Dump reports: `Backtest.dump()`, `Live.dump()`.
+
+## 🌐 Global Configuration
+
+Customize via `setConfig()`:
+
+- `CC_SCHEDULE_AWAIT_MINUTES`: Pending timeout (default: 120).
+- `CC_AVG_PRICE_CANDLES_COUNT`: VWAP candles (default: 5).
+
+## 💻 Developer Note
+
+Backtest Kit is **not a data-processing library** - it is a **time execution engine**. Think of the engine as an **async stream of time**, where your strategy is evaluated step by step.
+
+### 🔍 How PNL Works
+
+These three functions work together to dynamically manage the position. To reduce position linearity, by default, each DCA entry is formatted as a fixed **unit of $100**. This can be changed. No mathematical knowledge is required.
+
+**Public API:**
+- **`commitAverageBuy`** — adds a new DCA entry. By default, **only accepted when current price is below a new low**. Silently rejected otherwise. This prevents averaging up. Can be overridden using `setConfig`
+- **`commitPartialProfit`** — closes X% of the position at a profit. Locks in gains while keeping exposure.
+- **`commitPartialLoss`** — closes X% of the position at a loss. Cuts exposure before the stop-loss is hit.
+
+<details>
+  <summary>
+    The Math
+  </summary>
+
+  **Scenario:** LONG entry @ 1000, 4 DCA attempts (1 rejected), 3 partials, closed at TP.
+  `totalInvested = $400` (4 × $100, rejected attempt not counted).
+
+  **Entries**
+  ```
+    entry#1 @ 1000  → 0.10000 coins
+      commitPartialProfit(30%) @ 1150          ← cnt=1
+    entry#2 @ 950   → 0.10526 coins
+    entry#3 @ 880   → 0.11364 coins
+      commitPartialLoss(20%)   @ 860           ← cnt=3
+    entry#4 @ 920   → 0.10870 coins
+      commitPartialProfit(40%) @ 1050          ← cnt=4
+    entry#5 @ 980   ✗ REJECTED (980 > ep3≈929.92)
+    totalInvested = $400
+  ```
+
+  **Partial#1 — commitPartialProfit @ 1150, 30%, cnt=1**
+  ```
+    effectivePrice = hm(1000) = 1000
+    costBasis = $100
+    partialDollarValue = 30% × 100 = $30  → weight = 30/400 = 0.075
+    pnl = (1150−1000)/1000 × 100 = +15.00%
+    costBasis → $70
+    coins sold: 0.03000 × 1150 = $34.50
+    remaining:  0.07000
+  ```
+
+  **DCA after Partial#1**
+  ```
+    entry#2 @ 950  (950 < ep1=1000 ✓ accepted)
+    entry#3 @ 880  (880 < ep1=1000 ✓ accepted)
+    coins: 0.07000 + 0.10526 + 0.11364 = 0.28890
+  ```
+
+  **Partial#2 — commitPartialLoss @ 860, 20%, cnt=3**
+  ```
+    costBasis = 70 + 100 + 100 = $270
+    ep2 = 270 / 0.28890 ≈ 934.58
+    partialDollarValue = 20% × 270 = $54  → weight = 54/400 = 0.135
+    pnl = (860−934.58)/934.58 × 100 ≈ −7.98%
+    costBasis → $216
+    coins sold: 0.05778 × 860 = $49.69
+    remaining:  0.23112
+  ```
+
+  **DCA after Partial#2**
+  ```
+    entry#4 @ 920  (920 < ep2=934.58 ✓ accepted)
+    coins: 0.23112 + 0.10870 = 0.33982
+  ```
+
+  **Partial#3 — commitPartialProfit @ 1050, 40%, cnt=4**
+  ```
+    costBasis = 216 + 100 = $316
+    ep3 = 316 / 0.33982 ≈ 929.92
+    partialDollarValue = 40% × 316 = $126.4  → weight = 126.4/400 = 0.316
+    pnl = (1050−929.92)/929.92 × 100 ≈ +12.91%
+    costBasis → $189.6
+    coins sold: 0.13593 × 1050 = $142.72
+    remaining:  0.20389
+  ```
+
+  **DCA after Partial#3 — rejected**
+  ```
+    entry#5 @ 980  (980 > ep3≈929.92 ✗ REJECTED)
+  ```
+
+  **Close at TP @ 1200**
+  ```
+    ep_final = ep3 ≈ 929.92  (no new entries)
+    coins: 0.20389
+
+    remainingDollarValue = 400 − 30 − 54 − 126.4 = $189.6
+    weight = 189.6/400 = 0.474
+    pnl = (1200−929.92)/929.92 × 100 ≈ +29.04%
+    coins sold: 0.20389 × 1200 = $244.67
+  ```
+
+  **Result (toProfitLossDto)**
+  ```
+    0.075 × (+15.00) = +1.125
+    0.135 × (−7.98)  = −1.077
+    0.316 × (+12.91) = +4.080
+    0.474 × (+29.04) = +13.765
+    ─────────────────────────────
+                    ≈ +17.89%
+
+    Cross-check (coins):
+    34.50 + 49.69 + 142.72 + 244.67 = $471.58
+    (471.58 − 400) / 400 × 100      = +17.90%  ✓
+  ```
+</details>
+
+#### Internals
+
+**`priceOpen`** is the harmonic mean of all accepted DCA entries. After each partial close (`commitPartialProfit` or `commitPartialLoss`), the remaining cost basis is carried forward into the harmonic mean calculation for subsequent entries — so `priceOpen` shifts after every partial, which in turn changes whether the next `commitAverageBuy` call will be accepted.
+
+### 🔍 How Broker Transactional Integrity Works
+
+`Broker.useBrokerAdapter` connects a live exchange (ccxt, Binance, etc.) to the framework with transaction safety. Every commit method fires **before** the internal position state mutates. If the exchange rejects the order, the fill times out, or the network fails, the adapter throws, the mutation is skipped, and backtest-kit retries automatically on the next tick.
+
+<details>
+  <summary>
+    The code
+  </summary>
+
+**Spot**
+
+```typescript
+import ccxt from "ccxt";
+import { singleshot, sleep } from "functools-kit";
+import {
+  Broker,
+  IBroker,
+  BrokerSignalOpenPayload,
+  BrokerSignalClosePayload,
+  BrokerPartialProfitPayload,
+  BrokerPartialLossPayload,
+  BrokerTrailingStopPayload,
+  BrokerTrailingTakePayload,
+  BrokerBreakevenPayload,
+  BrokerAverageBuyPayload,
+} from "backtest-kit";
+
+const FILL_POLL_INTERVAL_MS = 10_000;
+const FILL_POLL_ATTEMPTS = 10;
+
+/**
+ * Sleep between cancelOrder and fetchBalance to allow Binance to settle the
+ * cancellation — reads immediately after cancel may return stale data.
+ */
+const CANCEL_SETTLE_MS = 2_000;
+
+/**
+ * Slippage buffer for stop_loss_limit on Spot — limit price is set slightly
+ * below stopPrice so the order fills even on a gap down instead of hanging.
+ */
+const STOP_LIMIT_SLIPPAGE = 0.995;
+
+const getSpotExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    apiKey: process.env.BINANCE_API_KEY,
+    secret: process.env.BINANCE_API_SECRET,
+    options: {
+      defaultType: "spot",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+/**
+ * Resolve base currency from market metadata — safe for all quote currencies (USDT, USDC, FDUSD, etc.)
+ */
+function getBase(exchange: ccxt.binance, symbol: string): string {
+  return exchange.markets[symbol].base;
+}
+
+/**
+ * Truncate qty to exchange precision, always rounding down.
+ * Prevents over-selling due to floating point drift from fetchBalance.
+ */
+function truncateQty(exchange: ccxt.binance, symbol: string, qty: number): number {
+  return parseFloat(exchange.amountToPrecision(symbol, qty, exchange.TRUNCATE));
+}
+
+/**
+ * Fetch current free balance for base currency of symbol.
+ */
+async function fetchFreeQty(exchange: ccxt.binance, symbol: string): Promise<number> {
+  const balance = await exchange.fetchBalance();
+  const base    = getBase(exchange, symbol);
+  return parseFloat(String(balance?.free?.[base] ?? 0));
+}
+
+/**
+ * Cancel all orders in parallel — allSettled so a single failure (already filled,
+ * network blip) does not leave remaining orders uncancelled.
+ */
+async function cancelAllOrders(exchange: ccxt.binance, orders: ccxt.Order[], symbol: string): Promise<void> {
+  await Promise.allSettled(orders.map((o) => exchange.cancelOrder(o.id, symbol)));
+}
+
+/**
+ * Place a stop_loss_limit sell order with a slippage buffer on the limit price.
+ * stop_loss_limit requires both stopPrice (trigger) and price (limit fill).
+ * Setting them equal risks non-fill on gap down — limit is offset by STOP_LIMIT_SLIPPAGE.
+ */
+async function createStopLossOrder(
+  exchange: ccxt.binance,
+  symbol: string,
+  qty: number,
+  stopPrice: number
+): Promise<void> {
+  const limitPrice = parseFloat(exchange.priceToPrecision(symbol, stopPrice * STOP_LIMIT_SLIPPAGE));
+  await exchange.createOrder(symbol, "stop_loss_limit", "sell", qty, limitPrice, { stopPrice });
+}
+
+/**
+ * Place a limit order and poll until filled (status === "closed").
+ * On timeout: cancel the order, settle, check partial fill and sell it via market,
+ * restore SL/TP on remaining position so it is never left unprotected, then throw.
+ */
+async function createLimitOrderAndWait(
+  exchange: ccxt.binance,
+  symbol: string,
+  side: "buy" | "sell",
+  qty: number,
+  price: number,
+  restore?: { tpPrice: number; slPrice: number }
+): Promise<void> {
+  const order = await exchange.createOrder(symbol, "limit", side, qty, price);
+
+  for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
+    await sleep(FILL_POLL_INTERVAL_MS);
+    const status = await exchange.fetchOrder(order.id, symbol);
+    if (status.status === "closed") {
+      return;
+    }
+  }
+
+  await exchange.cancelOrder(order.id, symbol);
+
+  // Wait for Binance to settle the cancellation before reading filled qty
+  await sleep(CANCEL_SETTLE_MS);
+
+  const final     = await exchange.fetchOrder(order.id, symbol);
+  const filledQty = final.filled ?? 0;
+
+  if (filledQty > 0) {
+    // Sell partial fill via market to restore clean exchange state before backtest-kit retries
+    const rollbackSide = side === "buy" ? "sell" : "buy";
+    await exchange.createOrder(symbol, "market", rollbackSide, filledQty);
+  }
+
+  // Restore SL/TP on remaining position so it is not left unprotected during retry
+  if (restore) {
+    const remainingQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+    if (remainingQty > 0) {
+      await exchange.createOrder(symbol, "limit", "sell", remainingQty, restore.tpPrice);
+      await createStopLossOrder(exchange, symbol, remainingQty, restore.slPrice);
+    }
+  }
+
+  throw new Error(`Limit order ${order.id} [${side} ${qty} ${symbol} @ ${price}] not filled in time — partial fill rolled back, backtest-kit will retry`);
+}
+
+Broker.useBrokerAdapter(
+  class implements IBroker {
+
+    async waitForInit(): Promise<void> {
+      await getSpotExchange();
+    }
+
+    async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+      const { symbol, cost, priceOpen, priceTakeProfit, priceStopLoss, position } = payload;
+
+      // Spot does not support short selling — reject immediately so backtest-kit skips the mutation
+      if (position === "short") {
+        throw new Error(`SpotBrokerAdapter: short position is not supported on spot (symbol=${symbol})`);
+      }
+
+      const exchange = await getSpotExchange();
+
+      const qty = truncateQty(exchange, symbol, cost / priceOpen);
+
+      // Guard: truncation may produce 0 if cost/price is below lot size
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
+      }
+
+      const openPrice = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
+      const tpPrice   = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice   = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      // Entry: no restore needed — position does not exist yet if entry times out
+      await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice);
+
+      // Post-fill: if TP/SL placement fails, position is open and unprotected — close via market
+      try {
+        await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+        await createStopLossOrder(exchange, symbol, qty, slPrice);
+      } catch (err) {
+        await exchange.createOrder(symbol, "market", "sell", qty);
+        throw err;
+      }
+    }
+
+    async onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void> {
+      const { symbol, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+
+      // Position already closed by SL/TP on exchange — nothing to do, commit succeeds
+      if (qty === 0) {
+        return;
+      }
+
+      const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      // Restore SL/TP if close times out so position is not left unprotected during retry
+      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+    }
+
+    async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchFreeQty(exchange, symbol);
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (totalQty === 0) {
+        throw new Error(`PartialProfit skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      // Restore SL/TP on remaining qty if partial close times out so position is not left unprotected
+      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+
+      // Restore SL/TP on remaining qty after successful partial close
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", "sell", remainingQty, tpPrice);
+          await createStopLossOrder(exchange, symbol, remainingQty, slPrice);
+        } catch (err) {
+          // Remaining position is unprotected — close via market
+          await exchange.createOrder(symbol, "market", "sell", remainingQty);
+          throw err;
+        }
+      }
+    }
+
+    async onPartialLossCommit(payload: BrokerPartialLossPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchFreeQty(exchange, symbol);
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (totalQty === 0) {
+        throw new Error(`PartialLoss skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      // Restore SL/TP on remaining qty if partial close times out so position is not left unprotected
+      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+
+      // Restore SL/TP on remaining qty after successful partial close
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", "sell", remainingQty, tpPrice);
+          await createStopLossOrder(exchange, symbol, remainingQty, slPrice);
+        } catch (err) {
+          // Remaining position is unprotected — close via market
+          await exchange.createOrder(symbol, "market", "sell", remainingQty);
+          throw err;
+        }
+      }
+    }
+
+    async onTrailingStopCommit(payload: BrokerTrailingStopPayload): Promise<void> {
+      const { symbol, newStopLossPrice } = payload;
+      const exchange = await getSpotExchange();
+
+      // Cancel existing SL order only — Spot has no reduceOnly, filter by side + type
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        o.side === "sell" &&
+        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (qty === 0) {
+        throw new Error(`TrailingStop skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+
+      await createStopLossOrder(exchange, symbol, qty, slPrice);
+    }
+
+    async onTrailingTakeCommit(payload: BrokerTrailingTakePayload): Promise<void> {
+      const { symbol, newTakeProfitPrice } = payload;
+      const exchange = await getSpotExchange();
+
+      // Cancel existing TP order only — Spot has no reduceOnly, filter by side + type
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const tpOrder = orders.find((o) =>
+        o.side === "sell" &&
+        ["limit", "LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (tpOrder) {
+        await exchange.cancelOrder(tpOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (qty === 0) {
+        throw new Error(`TrailingTake skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const tpPrice = parseFloat(exchange.priceToPrecision(symbol, newTakeProfitPrice));
+
+      await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+    }
+
+    async onBreakevenCommit(payload: BrokerBreakevenPayload): Promise<void> {
+      const { symbol, newStopLossPrice } = payload;
+      const exchange = await getSpotExchange();
+
+      // Cancel existing SL order only — Spot has no reduceOnly, filter by side + type
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        o.side === "sell" &&
+        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (qty === 0) {
+        throw new Error(`Breakeven skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+
+      await createStopLossOrder(exchange, symbol, qty, slPrice);
+    }
+
+    async onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void> {
+      const { symbol, currentPrice, cost, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      // Cancel existing SL/TP first — existing check must happen after cancel+settle
+      // to avoid race condition where SL/TP fills between the existence check and cancel
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      // Guard against DCA into a ghost position — checked after cancel so the snapshot is fresh
+      const existing    = await fetchFreeQty(exchange, symbol);
+      const minNotional = exchange.markets[symbol].limits?.cost?.min ?? 1;
+
+      // Compare notional value rather than raw qty — avoids float === 0 trap
+      // and correctly rejects dust balances left over from previous trades
+      if (existing * currentPrice < minNotional) {
+        throw new Error(`AverageBuy skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const qty = truncateQty(exchange, symbol, cost / currentPrice);
+
+      // Guard: truncation may produce 0 if cost/price is below lot size
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${currentPrice}`);
+      }
+
+      const entryPrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      // DCA entry: restore SL/TP on existing qty if times out so position is not left unprotected
+      await createLimitOrderAndWait(exchange, symbol, "buy", qty, entryPrice, { tpPrice, slPrice });
+
+      // Refetch balance after fill — existing snapshot is stale after cancel + fill
+      const totalQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+
+      // Recreate SL/TP on fresh total qty after successful fill
+      try {
+        await exchange.createOrder(symbol, "limit", "sell", totalQty, tpPrice);
+        await createStopLossOrder(exchange, symbol, totalQty, slPrice);
+      } catch (err) {
+        // Total position is unprotected — close via market
+        await exchange.createOrder(symbol, "market", "sell", totalQty);
+        throw err;
+      }
+    }
+  }
+);
+
+Broker.enable();
+```
+
+**Futures**
+
+```typescript
+import ccxt from "ccxt";
+import { singleshot, sleep } from "functools-kit";
+import {
+  Broker,
+  IBroker,
+  BrokerSignalOpenPayload,
+  BrokerSignalClosePayload,
+  BrokerPartialProfitPayload,
+  BrokerPartialLossPayload,
+  BrokerTrailingStopPayload,
+  BrokerTrailingTakePayload,
+  BrokerBreakevenPayload,
+  BrokerAverageBuyPayload,
+} from "backtest-kit";
+
+const FILL_POLL_INTERVAL_MS = 10_000;
+const FILL_POLL_ATTEMPTS = 10;
+
+/**
+ * Sleep between cancelOrder and fetchPositions to allow Binance to settle the
+ * cancellation — reads immediately after cancel may return stale data.
+ */
+const CANCEL_SETTLE_MS = 2_000;
+
+/**
+ * 3x leverage — conservative choice for $1000 total fiat.
+ * Enough to matter, not enough to liquidate on normal volatility.
+ * Applied per-symbol on first open via setLeverage.
+ */
+const FUTURES_LEVERAGE = 3;
+
+const getFuturesExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    apiKey: process.env.BINANCE_API_KEY,
+    secret: process.env.BINANCE_API_SECRET,
+    options: {
+      defaultType: "future",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+/**
+ * Truncate qty to exchange precision, always rounding down.
+ * Prevents over-selling due to floating point drift from fetchPositions.
+ */
+function truncateQty(exchange: ccxt.binance, symbol: string, qty: number): number {
+  return parseFloat(exchange.amountToPrecision(symbol, qty, exchange.TRUNCATE));
+}
+
+/**
+ * Resolve position for symbol filtered by side — safe in both one-way and hedge mode.
+ */
+function findPosition(positions: ccxt.Position[], symbol: string, side: "long" | "short") {
+  // Hedge mode: positions have explicit side field
+  const hedged = positions.find((p) => p.symbol === symbol && p.side === side);
+  if (hedged) {
+    return hedged;
+  }
+  // One-way mode: single position per symbol, side field may be undefined or mismatched
+  const pos = positions.find((p) => p.symbol === symbol) ?? null;
+  if (pos && pos.side && pos.side !== side) {
+    console.warn(`findPosition: expected side="${side}" but exchange returned side="${pos.side}" for ${symbol} — possible one-way/hedge mode mismatch`);
+  }
+  return pos;
+}
+
+/**
+ * Fetch current contracts qty for symbol/side.
+ */
+async function fetchContractsQty(
+  exchange: ccxt.binance,
+  symbol: string,
+  side: "long" | "short"
+): Promise<number> {
+  const positions = await exchange.fetchPositions([symbol]);
+  const pos       = findPosition(positions, symbol, side);
+  return Math.abs(parseFloat(String(pos?.contracts ?? 0)));
+}
+
+/**
+ * Cancel all orders in parallel — allSettled so a single failure (already filled,
+ * network blip) does not leave remaining orders uncancelled.
+ */
+async function cancelAllOrders(exchange: ccxt.binance, orders: ccxt.Order[], symbol: string): Promise<void> {
+  await Promise.allSettled(orders.map((o) => exchange.cancelOrder(o.id, symbol)));
+}
+
+/**
+ * Resolve Binance positionSide string from position direction.
+ * Required in hedge mode to correctly route orders; ignored in one-way mode.
+ */
+function toPositionSide(position: "long" | "short"): "LONG" | "SHORT" {
+  return position === "long" ? "LONG" : "SHORT";
+}
+
+/**
+ * Place a limit order and poll until filled (status === "closed").
+ * On timeout: cancel the order, settle, check partial fill and close it via market,
+ * restore SL/TP on remaining position so it is never left unprotected, then throw.
+ *
+ * positionSide is forwarded into rollback market order so hedge mode accounts
+ * correctly route the close without -4061 error.
+ */
+async function createLimitOrderAndWait(
+  exchange: ccxt.binance,
+  symbol: string,
+  side: "buy" | "sell",
+  qty: number,
+  price: number,
+  params: Record<string, unknown> = {},
+  restore?: { exitSide: "buy" | "sell"; tpPrice: number; slPrice: number; positionSide: "long" | "short" }
+): Promise<void> {
+  const order = await exchange.createOrder(symbol, "limit", side, qty, price, params);
+
+  for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
+    await sleep(FILL_POLL_INTERVAL_MS);
+    const status = await exchange.fetchOrder(order.id, symbol);
+    if (status.status === "closed") {
+      return;
+    }
+  }
+
+  await exchange.cancelOrder(order.id, symbol);
+
+  // Wait for Binance to settle the cancellation before reading filled qty
+  await sleep(CANCEL_SETTLE_MS);
+
+  const final     = await exchange.fetchOrder(order.id, symbol);
+  const filledQty = final.filled ?? 0;
+
+  if (filledQty > 0) {
+    // Close partial fill via market — positionSide required in hedge mode (-4061 without it)
+    const rollbackSide        = side === "buy" ? "sell" : "buy";
+    const rollbackPositionSide = params.positionSide ?? (restore ? toPositionSide(restore.positionSide) : undefined);
+    await exchange.createOrder(symbol, "market", rollbackSide, filledQty, undefined, {
+      reduceOnly: true,
+      ...(rollbackPositionSide ? { positionSide: rollbackPositionSide } : {}),
+    });
+  }
+
+  // Restore SL/TP on remaining position so it is not left unprotected during retry
+  if (restore) {
+    const remainingQty = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, restore.positionSide));
+    if (remainingQty > 0) {
+      await exchange.createOrder(symbol, "limit", restore.exitSide, remainingQty, restore.tpPrice, { reduceOnly: true });
+      await exchange.createOrder(symbol, "stop_market", restore.exitSide, remainingQty, undefined, { stopPrice: restore.slPrice, reduceOnly: true });
+    }
+  }
+
+  throw new Error(`Limit order ${order.id} [${side} ${qty} ${symbol} @ ${price}] not filled in time — partial fill rolled back, backtest-kit will retry`);
+}
+
+Broker.useBrokerAdapter(
+  class implements IBroker {
+
+    async waitForInit(): Promise<void> {
+      await getFuturesExchange();
+    }
+
+    async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+      const { symbol, cost, priceOpen, priceTakeProfit, priceStopLoss, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      // Set leverage before entry — ensures consistent leverage regardless of previous session state
+      await exchange.setLeverage(FUTURES_LEVERAGE, symbol);
+
+      const qty = truncateQty(exchange, symbol, cost / priceOpen);
+
+      // Guard: truncation may produce 0 if cost/price is below lot size
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
+      }
+
+      const openPrice    = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const entrySide    = position === "long" ? "buy"  : "sell";
+      const exitSide     = position === "long" ? "sell" : "buy";
+      // positionSide required in hedge mode (-4061 without it); ignored in one-way mode
+      const positionSide = toPositionSide(position);
+
+      // Entry: no restore needed — position does not exist yet if entry times out
+      await createLimitOrderAndWait(exchange, symbol, entrySide, qty, openPrice, { positionSide });
+
+      // Post-fill: if TP/SL placement fails, position is open and unprotected — close via market
+      try {
+        await exchange.createOrder(symbol, "limit", exitSide, qty, tpPrice, { reduceOnly: true, positionSide });
+        await exchange.createOrder(symbol, "stop_market", exitSide, qty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+      } catch (err) {
+        await exchange.createOrder(symbol, "market", exitSide, qty, undefined, { reduceOnly: true, positionSide });
+        throw err;
+      }
+    }
+
+    async onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void> {
+      const { symbol, position, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+
+      // Position already closed by SL/TP on exchange — throw so backtest-kit can reconcile
+      // the close price via its own mechanism rather than assuming a successful manual close
+      if (qty === 0) {
+        throw new Error(`SignalClose skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      // reduceOnly: prevents accidental reversal if qty has drift vs real position
+      // Restore SL/TP if close times out so position is not left unprotected during retry
+      await createLimitOrderAndWait(
+        exchange, symbol, exitSide, qty, closePrice,
+        { reduceOnly: true },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+    }
+
+    async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, position, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchContractsQty(exchange, symbol, position);
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (totalQty === 0) {
+        throw new Error(`PartialProfit skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const exitSide     = position === "long" ? "sell" : "buy";
+      const positionSide = toPositionSide(position);
+
+      // reduceOnly: prevents accidental reversal if qty has drift vs real position
+      // Restore SL/TP on remaining qty if partial close times out so position is not left unprotected
+      await createLimitOrderAndWait(
+        exchange, symbol, exitSide, qty, closePrice,
+        { reduceOnly: true },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+
+      // Restore SL/TP on remaining qty after successful partial close
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", exitSide, remainingQty, tpPrice, { reduceOnly: true, positionSide });
+          await exchange.createOrder(symbol, "stop_market", exitSide, remainingQty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+        } catch (err) {
+          // Remaining position is unprotected — close via market
+          await exchange.createOrder(symbol, "market", exitSide, remainingQty, undefined, { reduceOnly: true, positionSide });
+          throw err;
+        }
+      }
+    }
+
+    async onPartialLossCommit(payload: BrokerPartialLossPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, position, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchContractsQty(exchange, symbol, position);
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (totalQty === 0) {
+        throw new Error(`PartialLoss skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const exitSide     = position === "long" ? "sell" : "buy";
+      const positionSide = toPositionSide(position);
+
+      // reduceOnly: prevents accidental reversal if qty has drift vs real position
+      // Restore SL/TP on remaining qty if partial close times out so position is not left unprotected
+      await createLimitOrderAndWait(
+        exchange, symbol, exitSide, qty, closePrice,
+        { reduceOnly: true },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+
+      // Restore SL/TP on remaining qty after successful partial close
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", exitSide, remainingQty, tpPrice, { reduceOnly: true, positionSide });
+          await exchange.createOrder(symbol, "stop_market", exitSide, remainingQty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+        } catch (err) {
+          // Remaining position is unprotected — close via market
+          await exchange.createOrder(symbol, "market", exitSide, remainingQty, undefined, { reduceOnly: true, positionSide });
+          throw err;
+        }
+      }
+    }
+
+    async onTrailingStopCommit(payload: BrokerTrailingStopPayload): Promise<void> {
+      const { symbol, newStopLossPrice, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      // Cancel existing SL order only — filter by reduceOnly to avoid cancelling unrelated orders
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        !!o.reduceOnly &&
+        ["stop_market", "stop", "STOP_MARKET"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (qty === 0) {
+        throw new Error(`TrailingStop skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+      const positionSide = toPositionSide(position);
+
+      // positionSide required in hedge mode (-4061 without it); ignored in one-way mode
+      await exchange.createOrder(symbol, "stop_market", exitSide, qty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+    }
+
+    async onTrailingTakeCommit(payload: BrokerTrailingTakePayload): Promise<void> {
+      const { symbol, newTakeProfitPrice, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      // Cancel existing TP order only — filter by reduceOnly to avoid cancelling unrelated orders
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const tpOrder = orders.find((o) =>
+        !!o.reduceOnly &&
+        ["limit", "LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (tpOrder) {
+        await exchange.cancelOrder(tpOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (qty === 0) {
+        throw new Error(`TrailingTake skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, newTakeProfitPrice));
+      const positionSide = toPositionSide(position);
+
+      // positionSide required in hedge mode (-4061 without it); ignored in one-way mode
+      await exchange.createOrder(symbol, "limit", exitSide, qty, tpPrice, { reduceOnly: true, positionSide });
+    }
+
+    async onBreakevenCommit(payload: BrokerBreakevenPayload): Promise<void> {
+      const { symbol, newStopLossPrice, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      // Cancel existing SL order only — filter by reduceOnly to avoid cancelling unrelated orders
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        !!o.reduceOnly &&
+        ["stop_market", "stop", "STOP_MARKET"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+
+      // Position may have already been closed by SL/TP on exchange — skip gracefully
+      if (qty === 0) {
+        throw new Error(`Breakeven skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+      const positionSide = toPositionSide(position);
+
+      // positionSide required in hedge mode (-4061 without it); ignored in one-way mode
+      await exchange.createOrder(symbol, "stop_market", exitSide, qty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+    }
+
+    async onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void> {
+      const { symbol, currentPrice, cost, position, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      // Cancel existing SL/TP first — existing check must happen after cancel+settle
+      // to avoid race condition where SL/TP fills between the existence check and cancel
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      // Guard against DCA into a ghost position — checked after cancel so the snapshot is fresh
+      const existing    = await fetchContractsQty(exchange, symbol, position);
+      const minNotional = exchange.markets[symbol].limits?.cost?.min ?? 1;
+
+      // Compare notional value rather than raw contracts — avoids float === 0 trap
+      // and correctly rejects dust positions left over from previous trades
+      if (existing * currentPrice < minNotional) {
+        throw new Error(`AverageBuy skipped: no open position for ${symbol} on exchange — SL/TP may have already been filled`);
+      }
+
+      const qty = truncateQty(exchange, symbol, cost / currentPrice);
+
+      // Guard: truncation may produce 0 if cost/price is below lot size
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${currentPrice}`);
+      }
+
+      const entryPrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      // positionSide required in hedge mode to add to correct side; ignored in one-way mode
+      const positionSide = toPositionSide(position);
+      const entrySide    = position === "long" ? "buy"  : "sell";
+      const exitSide     = position === "long" ? "sell" : "buy";
+
+      // DCA entry: restore SL/TP on existing qty if times out so position is not left unprotected
+      await createLimitOrderAndWait(
+        exchange, symbol, entrySide, qty, entryPrice,
+        { positionSide },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+
+      // Refetch contracts after fill — existing snapshot is stale after cancel + fill
+      const totalQty = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+
+      // Recreate SL/TP on fresh total qty after successful fill
+      try {
+        await exchange.createOrder(symbol, "limit", exitSide, totalQty, tpPrice, { reduceOnly: true, positionSide });
+        await exchange.createOrder(symbol, "stop_market", exitSide, totalQty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+      } catch (err) {
+        // Total position is unprotected — close via market
+        await exchange.createOrder(symbol, "market", exitSide, totalQty, undefined, { reduceOnly: true, positionSide });
+        throw err;
+      }
+    }
+  }
+);
+
+Broker.enable();
+```
+
+</details>
+
+#### Internals
+
+Signal open/close events are routed automatically via an internal event bus once `Broker.enable()` is called. **No manual wiring needed.** All other operations (`partialProfit`, `trailingStop`, `breakeven`, `averageBuy`) are intercepted explicitly before the corresponding state mutation.
+
+### 🔍 How Cron Works
+
+`Cron` is a periodic / fire-once scheduler that runs in **virtual time** — the same time stream your strategies see in backtest mode. Handlers fire on candle-interval boundaries (`1m`, `5m`, `1h`, `1d`, …) and are coordinated across parallel `Backtest.background(symbol, ...)` runs so the same boundary never produces two concurrent invocations.
+
+**Public API:**
+- **`Cron.register({ name, interval?, symbols?, handler })`** — register a job. Returns a disposer. Re-registering the same `name` replaces the previous entry and bumps an internal generation counter (late writes from old handlers are ignored).
+- **`Cron.enable()`** — subscribe `Cron` to the engine's lifecycle subjects (`beforeStart`, `idlePing`, `activePing`, `schedulePing`). Wrapped in `singleshot`; call once at startup.
+- **`Cron.disable()`** — tear down the subscriptions installed by `enable()`. Safe to call multiple times and before `enable()`.
+- **`Cron.unregister(name)`** — remove a registered job.
+- **`Cron.clear(symbol?)`** — clear fire-once marks. `symbol` provided → fan-out marks for that symbol only; no argument → all marks. Does **not** touch in-flight handlers.
+
+**Two modes per `interval`:**
+- **Periodic** (`interval: "1h"`) — handler fires once per boundary of that interval.
+- **Fire-once** (`interval` omitted) — handler fires on the first matching tick and never again until `clear()` / `unregister` / re-`register`.
+
+**Two scopes per `symbols`:**
+- **Global** (`symbols` omitted) — handler fires once per boundary across all parallel backtests. First symbol to reach the boundary opens the slot; others await the same promise.
+- **Fan-out** (`symbols: ["BTC", "ETH"]`) — handler fires once per boundary **per whitelisted symbol**. Each symbol has its own slot.
+
+<details>
+  <summary>
+    The code
+  </summary>
+
+```typescript
+import { Cron, Backtest } from "backtest-kit";
+
+// Global hourly job — fires once per virtual hour across all parallel backtests.
+Cron.register({
+  name: "tg-signal-parser",
+  interval: "1h",
+  handler: async ({ symbol, when, backtest }) => {
+    await parseTelegramSignalsToMongo(when);
+  },
+});
+
+// Per-symbol fan-out — fires once per hour per whitelisted symbol.
+Cron.register({
+  name: "fetch-funding",
+  interval: "1h",
+  symbols: ["BTCUSDT", "ETHUSDT"],
+  handler: async ({ symbol, when, backtest }) => {
+    await fetchFundingRate(symbol, when);
+  },
+});
+
+// Fire-once warm-up — runs once globally on the very first tick.
+Cron.register({
+  name: "warm-cache",
+  handler: async ({ symbol, when, backtest }) => {
+    await warmupCache();
+  },
+});
+
+// Wire Cron to the engine once at startup. After this every strategy tick is
+// forwarded into Cron automatically — no manual listener wiring needed.
+Cron.enable();
+
+for (const symbol of ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "TRXUSDT"]) {
+  Backtest.background(symbol, { strategyName, exchangeName, frameName });
+}
+
+// On shutdown:
+// Cron.disable();
+```
+
+</details>
+
+#### Internals
+
+`Cron.enable()` subscribes a single `singlerun`-wrapped handler to four lifecycle subjects (`beforeStart`, `idlePing`, `activePing`, `schedulePing`). `singlerun` merges all four streams into one serial queue, so concurrent ticks on the same `(symbol, virtual-minute)` cannot race to open the same slot. Each incoming tick is **base-aligned to the 1-minute boundary** before any further processing — lifecycle pings may carry sub-second jitter, but Cron always reasons in whole minutes.
+
+Coordination keys are built as `${name}:${alignedMs}:${symbol?}:g${generation}`. Parallel backtests that hit the same key share a single in-flight promise (mutex semantics): the first opens the slot and runs the handler, others `await` the same promise and release together. After `.finally()` the slot is removed and the next boundary creates a fresh promise. Fire-once entries additionally record a `_firedOnce` mark on success so subsequent ticks skip them — a failed handler is **not** marked, so it retries on the next tick. The generation suffix isolates re-registrations: a late write from a still-in-flight handler of a previous `register()` carries the old generation and never collides with the new entry.
+
+### 🔍 How getCandles Works
+
+backtest-kit uses Node.js `AsyncLocalStorage` to automatically provide
+temporal time context to your strategies.
+
+<details>
+  <summary>
+    The Math
+  </summary>
+
+  For a candle with:
+  - `timestamp` = candle open time (openTime)
+  - `stepMs` = interval duration (e.g., 60000ms for "1m")
+  - Candle close time = `timestamp + stepMs`
+
+  **Alignment:** All timestamps are aligned down to interval boundary.
+  For example, for 15m interval: 00:17 → 00:15, 00:44 → 00:30
+
+  **Adapter contract:**
+  - First candle.timestamp must equal aligned `since`
+  - Adapter must return exactly `limit` candles
+  - Sequential timestamps: `since + i * stepMs` for i = 0..limit-1
+
+  **How `since` is calculated from `when`:**
+  - `when` = current execution context time (from AsyncLocalStorage)
+  - `alignedWhen` = `Math.floor(when / stepMs) * stepMs` (aligned down to interval boundary)
+  - `since` = `alignedWhen - limit * stepMs` (go back `limit` candles from aligned when)
+
+  **Boundary semantics (inclusive/exclusive):**
+  - `since` is always **inclusive** — first candle has `timestamp === since`
+  - Exactly `limit` candles are returned
+  - Last candle has `timestamp === since + (limit - 1) * stepMs` — **inclusive**
+  - For `getCandles`: `alignedWhen` is **exclusive** — candle at that timestamp is NOT included (it's a pending/incomplete candle)
+  - For `getRawCandles`: `eDate` is **exclusive** — candle at that timestamp is NOT included (it's a pending/incomplete candle)
+  - For `getNextCandles`: `alignedWhen` is **inclusive** — first candle starts at `alignedWhen` (it's the current candle for backtest, already closed in historical data)
+
+  - `getCandles(symbol, interval, limit)` - Returns exactly `limit` candles
+    - Aligns `when` down to interval boundary
+    - Calculates `since = alignedWhen - limit * stepMs`
+    - **since — inclusive**, first candle.timestamp === since
+    - **alignedWhen — exclusive**, candle at alignedWhen is NOT returned
+    - Range: `[since, alignedWhen)` — half-open interval
+    - Example: `getCandles("BTCUSDT", "1m", 100)` returns 100 candles ending before aligned when
+
+  - `getNextCandles(symbol, interval, limit)` - Returns exactly `limit` candles (backtest only)
+    - Aligns `when` down to interval boundary
+    - `since = alignedWhen` (starts from aligned when, going forward)
+    - **since — inclusive**, first candle.timestamp === since
+    - Range: `[alignedWhen, alignedWhen + limit * stepMs)` — half-open interval
+    - Throws error in live mode to prevent look-ahead bias
+    - Example: `getNextCandles("BTCUSDT", "1m", 10)` returns next 10 candles starting from aligned when
+
+  - `getRawCandles(symbol, interval, limit?, sDate?, eDate?)` - Flexible parameter combinations:
+    - `(limit)` - since = alignedWhen - limit * stepMs, range `[since, alignedWhen)`
+    - `(limit, sDate)` - since = align(sDate), returns `limit` candles forward, range `[since, since + limit * stepMs)`
+    - `(limit, undefined, eDate)` - since = align(eDate) - limit * stepMs, **eDate — exclusive**, range `[since, eDate)`
+    - `(undefined, sDate, eDate)` - since = align(sDate), limit calculated from range, **sDate — inclusive, eDate — exclusive**, range `[sDate, eDate)`
+    - `(limit, sDate, eDate)` - since = align(sDate), returns `limit` candles, **sDate — inclusive**
+    - All combinations respect look-ahead bias protection (eDate/endTime <= when)
+
+  **Persistent Cache:**
+  - Cache lookup calculates expected timestamps: `since + i * stepMs` for i = 0..limit-1
+  - Returns all candles if found, null if any missing (cache miss)
+  - Cache and runtime use identical timestamp calculation logic
+
+</details>
+
+#### Candle Timestamp Convention:
+
+According to this `timestamp` of a candle in backtest-kit is exactly the `openTime`, not ~~`closeTime`~~
+
+**Key principles:**
+- All timestamps are aligned down to interval boundary
+- First candle.timestamp must equal aligned `since`
+- Adapter must return exactly `limit` candles
+- Sequential timestamps: `since + i * stepMs`
+
+
+### 🔍 How getOrderBook Works
+
+Order book fetching uses the same temporal alignment as candles, but with a configurable time offset window instead of candle intervals.
+
+  <details>
+    <summary>
+      The Math
+    </summary>
+
+    **Time range calculation:**
+    - `when` = current execution context time (from AsyncLocalStorage)
+    - `offsetMinutes` = `CC_ORDER_BOOK_TIME_OFFSET_MINUTES` (configurable)
+    - `alignedTo` = `Math.floor(when / (offsetMinutes * 60000)) * (offsetMinutes * 60000)`
+    - `to` = `alignedTo` (aligned down to offset boundary)
+    - `from` = `alignedTo - offsetMinutes * 60000`
+
+    **Adapter contract:**
+    - `getOrderBook(symbol, depth, from, to, backtest)` is called on the exchange schema
+    - `depth` defaults to `CC_ORDER_BOOK_MAX_DEPTH_LEVELS`
+    - The `from`/`to` range represents a time window of exactly `offsetMinutes` duration
+    - Schema implementation may use the time range (backtest) or ignore it (live trading)
+
+    **Example with CC_ORDER_BOOK_TIME_OFFSET_MINUTES = 10:**
+    ```
+    when = 1704067920000       // 2024-01-01 00:12:00 UTC
+    offsetMinutes = 10
+    offsetMs = 10 * 60000      // 600000ms
+
+    alignedTo = Math.floor(1704067920000 / 600000) * 600000
+              = 1704067800000  // 2024-01-01 00:10:00 UTC
+
+    to   = 1704067800000       // 00:10:00 UTC
+    from = 1704067200000       // 00:00:00 UTC
+    ```
+  </details>
+
+#### Order Book Timestamp Convention:
+
+Unlike candles, most exchanges (e.g. Binance `GET /api/v3/depth`) only expose the **current** order book with no historical query support — for backtest you must provide your own snapshot storage.
+
+**Key principles:**
+- Time range is aligned down to `CC_ORDER_BOOK_TIME_OFFSET_MINUTES` boundary
+- `to` = aligned timestamp, `from` = `to - offsetMinutes * 60000`
+- `depth` defaults to `CC_ORDER_BOOK_MAX_DEPTH_LEVELS`
+- Adapter receives `(symbol, depth, from, to, backtest)` — may ignore `from`/`to` in live mode
+
+### 🔍 How getAggregatedTrades Works
+
+Aggregated trades fetching uses the same look-ahead bias protection as candles - `to` is always aligned down to the nearest minute boundary so future trades are never visible to the strategy.
+
+**Key principles:**
+- `to` is always aligned down to the 1-minute boundary — prevents look-ahead bias
+- Without `limit`: returns one full window (`CC_AGGREGATED_TRADES_MAX_MINUTES`)
+- With `limit`: paginates backwards until collected, then slices to most recent `limit`
+- Adapter receives `(symbol, from, to, backtest)` — may ignore `from`/`to` in live mode
+
+<details>
+  <summary>
+    The Math
+  </summary>
+
+  **Time range calculation:**
+  - `when` = current execution context time (from AsyncLocalStorage)
+  - `alignedTo` = `Math.floor(when / 60000) * 60000` (aligned down to 1-minute boundary)
+  - `windowMs` = `CC_AGGREGATED_TRADES_MAX_MINUTES * 60000 − 60000`
+  - `to` = `alignedTo`, `from` = `alignedTo − windowMs`
+
+  **Without `limit`:** fetches a single window and returns it as-is.
+
+  **With `limit`:** paginates backwards in `CC_AGGREGATED_TRADES_MAX_MINUTES` chunks until at least `limit` trades are collected, then slices to the most recent `limit` trades.
+
+  **Example with CC_AGGREGATED_TRADES_MAX_MINUTES = 60, limit = 200:**
+  ```
+  when       = 1704067920000   // 2024-01-01 00:12:00 UTC
+  alignedTo  = 1704067800000   // 2024-01-01 00:12:00 → aligned to 00:12:00
+  windowMs   = 59 * 60000      // 3540000ms = 59 minutes
+
+  Window 1:  from = 00:12:00 − 59m = 23:13:00
+              to   = 00:12:00
+  → got 120 trades — not enough
+
+  Window 2:  from = 23:13:00 − 59m = 22:14:00
+              to   = 23:13:00
+  → got 100 more → total 220 trades
+
+  result = last 200 of 220 (most recent)
+  ```
+
+  **Adapter contract:**
+  - `getAggregatedTrades(symbol, from, to, backtest)` is called on the exchange schema
+  - `from`/`to` are `Date` objects
+  - Schema implementation may use the time range (backtest) or ignore it (live trading)
+
+</details>
+
+#### Aggregated Trades Timestamp Convention:
+
+**Compatible with:** [garch](https://www.npmjs.com/package/garch) for volatility modelling and [volume-anomaly](https://www.npmjs.com/package/volume-anomaly) for detecting abnormal trade volume — both accept the same `from`/`to` time range format that `getAggregatedTrades` produces.
+
+### 🔬 Technical Details: Timestamp Alignment
+
+**Why align timestamps to interval boundaries?**
+
+Because candle APIs return data starting from exact interval boundaries:
+
+```typescript
+// 15-minute interval example:
+when = 1704067920000       // 00:12:00
+step = 15                  // 15 minutes
+stepMs = 15 * 60000        // 900000ms
+
+// Alignment: round down to nearest interval boundary
+alignedWhen = Math.floor(when / stepMs) * stepMs
+// = Math.floor(1704067920000 / 900000) * 900000
+// = 1704067200000 (00:00:00)
+
+// Calculate since for 4 candles backwards:
+since = alignedWhen - 4 * stepMs
+// = 1704067200000 - 4 * 900000
+// = 1704063600000 (23:00:00 previous day)
+
+// Expected candles:
+// [0] timestamp = 1704063600000 (23:00)
+// [1] timestamp = 1704064500000 (23:15)
+// [2] timestamp = 1704065400000 (23:30)
+// [3] timestamp = 1704066300000 (23:45)
+```
+
+**Pending candle exclusion:** The candle at `00:00:00` (alignedWhen) is NOT included in the result. At `when=00:12:00`, this candle covers the period `[00:00, 00:15)` and is still open (pending). Pending candles have incomplete OHLCV data that would distort technical indicators. Only fully closed candles are returned.
+
+**Validation is applied consistently across:**
+- ✅ `getCandles()` - validates first timestamp and count
+- ✅ `getNextCandles()` - validates first timestamp and count
+- ✅ `getRawCandles()` - validates first timestamp and count
+- ✅ Cache read - calculates exact expected timestamps
+- ✅ Cache write - stores validated candles
+
+**Result:** Deterministic candle retrieval with exact timestamp matching.
+
+### 🕐 Timezone Warning: Candle Boundaries Are UTC-Based
+
+All candle timestamp alignment uses UTC (Unix epoch). For intervals like `4h`, boundaries are `00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC`. If your local timezone offset is not a multiple of the interval, the `since` timestamps will look "uneven" in local time.
+
+For example, in UTC+5 the same 4h candle request logs as:
+
+```
+since: Sat Sep 20 2025 13:00:00 GMT+0500  ← looks uneven (13:00)
+since: Sat Sep 20 2025 17:00:00 GMT+0500  ← looks uneven (17:00)
+since: Sat Sep 20 2025 21:00:00 GMT+0500  ← looks uneven (21:00)
+since: Sun Sep 21 2025 05:00:00 GMT+0500  ← looks uneven (05:00)
+```
+
+But in UTC these are perfectly aligned 4h boundaries:
+
+```
+since: Sat, 20 Sep 2025 08:00:00 GMT  ← 08:00 UTC ✓
+since: Sat, 20 Sep 2025 12:00:00 GMT  ← 12:00 UTC ✓
+since: Sat, 20 Sep 2025 16:00:00 GMT  ← 16:00 UTC ✓
+since: Sun, 21 Sep 2025 00:00:00 GMT  ← 00:00 UTC ✓
+```
+
+Use `toUTCString()` or `toISOString()` in callbacks to see the actual aligned UTC times.
+
+### 💭 What this means:
+- `getCandles()` always returns data UP TO the current backtest timestamp using `async_hooks`
+- Multi-timeframe data is automatically synchronized
+- **Impossible to introduce look-ahead bias** - all time boundaries are enforced
+- Same code works in both backtest and live modes
+- Boundary semantics prevent edge cases in signal generation
+
+
+## 🧠 Two Ways to Run the Engine
+
+Backtest Kit exposes the same runtime in two equivalent forms. Both approaches use **the same engine and guarantees** - only the consumption model differs.
+
+### 1️⃣ Event-driven (background execution)
+
+Suitable for production bots, monitoring, and long-running processes.
+
+```typescript
+Backtest.background('BTCUSDT', config);
+
+listenSignalBacktest(event => { /* handle signals */ });
+listenDoneBacktest(event => { /* finalize / dump report */ });
+```
+
+### 2️⃣ Async Iterator (pull-based execution)
+
+Suitable for research, scripting, testing, and LLM agents.
+
+```typescript
+for await (const event of Backtest.run('BTCUSDT', config)) {
+  // signal | trade | progress | done
+}
+```
+
+## ⚔️ Think of it as...
+
+**Open-source QuantConnect/MetaTrader without the vendor lock-in**
+
+Unlike cloud-based platforms, backtest-kit runs entirely in your environment. You own the entire stack from data ingestion to live execution. In addition to Ollama, you can use [neural-trader](https://www.npmjs.com/package/neural-trader) in `getSignal` function or any other third party library
+
+- No C#/C++ required - pure TypeScript/JavaScript
+- Self-hosted - your code, your data, your infrastructure
+- No platform fees or hidden costs
+- Full control over execution and data sources
+- [GUI](https://npmjs.com/package/@backtest-kit/ui) for visualization and monitoring
+
+## 🌍 Ecosystem
+
+The `backtest-kit` ecosystem extends beyond the core library, offering complementary packages and tools to enhance your trading system development experience:
+
+
+### @backtest-kit/cli
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/cli)** 📟
+
+The **@backtest-kit/cli** package is a zero-boilerplate CLI runner for backtest-kit strategies. Point it at your strategy file and run backtests, paper trading, or live bots — no infrastructure code required.
+
+#### Key Features
+- 🚀 **Zero Config**: Run a backtest with one command — no setup code needed
+- 🔄 **Three Modes**: `--backtest`, `--paper`, `--live` with graceful SIGINT shutdown
+- 💾 **Auto Cache**: Warms OHLCV candle cache for all intervals before the backtest starts
+- 🌐 **Web Dashboard**: Launch `@backtest-kit/ui` with a single `--ui` flag
+- 📬 **Telegram Alerts**: Formatted trade notifications with price charts via `--telegram`
+- 🗂️ **Monorepo Ready**: Each strategy's `dump/`, `modules/`, and `template/` are automatically isolated by entry point directory
+
+#### Use Case
+The fastest way to run any backtest-kit strategy from the command line. Instead of writing boilerplate for storage, notifications, candle caching, and signal logging, add one dependency and wire up your `package.json` scripts. Works equally well for a single-strategy project or a monorepo with dozens of strategies in separate subdirectories.
+
+#### Get Started
+```bash
+npx -y @backtest-kit/cli --init
+```
+
+
+### @backtest-kit/pinets
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/pinets)** 📜
+
+The **@backtest-kit/pinets** package lets you run TradingView Pine Script strategies directly in Node.js. Port your existing Pine Script indicators to backtest-kit with zero rewrite using the [PineTS](https://github.com/QuantForgeOrg/PineTS) runtime.
+
+#### Key Features
+- 📜 **Pine Script v5/v6**: Native TradingView syntax with 1:1 compatibility
+- 🎯 **60+ Indicators**: SMA, EMA, RSI, MACD, Bollinger Bands, ATR, Stochastic built-in
+- 📁 **File or Code**: Load `.pine` files or pass code strings directly
+- 🗺️ **Plot Extraction**: Flexible mapping from Pine `plot()` outputs to structured signals
+- ⚡ **Cached Execution**: Memoized file reads for repeated strategy runs
+
+#### Use Case
+Perfect for traders who already have working TradingView strategies. Instead of rewriting your Pine Script logic in JavaScript, simply copy your `.pine` file and use `getSignal()` to extract trading signals. Works seamlessly with backtest-kit's temporal context - no look-ahead bias possible.
+
+#### Get Started
+```bash
+npm install @backtest-kit/pinets pinets backtest-kit
+```
+
+
+### @backtest-kit/graph
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/graph)** 🔗
+
+The **@backtest-kit/graph** package lets you compose backtest-kit computations as a typed directed acyclic graph (DAG). Define source nodes that fetch market data and output nodes that compute derived values — then resolve the whole graph in topological order with automatic parallelism.
+
+#### Key Features
+- 🔌 **DAG Execution**: Nodes are resolved bottom-up in topological order with `Promise.all` parallelism
+- 🔒 **Type-Safe Values**: TypeScript infers the return type of every node through the graph via generics
+- 🧱 **Two APIs**: Low-level `INode` for runtime/storage, high-level `sourceNode` + `outputNode` builders for authoring
+- 💾 **DB-Ready Serialization**: `serialize` / `deserialize` convert the graph to a flat `IFlatNode[]` list with `id` / `nodeIds`
+- 🌐 **Context-Aware Fetch**: `sourceNode` receives `(symbol, when, exchangeName)` from the execution context automatically
+
+#### Use Case
+Perfect for multi-timeframe strategies where multiple Pine Script or indicator computations must be combined. Instead of manually chaining async calls, define each computation as a node and let the graph resolve dependencies in parallel. Adding a new filter or timeframe requires no changes to the existing wiring.
+
+#### Get Started
+```bash
+npm install @backtest-kit/graph backtest-kit
+```
+
+
+### @backtest-kit/ui
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/ui)** 📊
+
+The **@backtest-kit/ui** package is a full-stack UI framework for visualizing cryptocurrency trading signals, backtests, and real-time market data. Combines a Node.js backend server with a React dashboard - all in one package.
+
+#### Key Features
+- 📈 **Interactive Charts**: Candlestick visualization with Lightweight Charts (1m, 15m, 1h timeframes)
+- 🎯 **Signal Tracking**: View opened, closed, scheduled, and cancelled signals with full details
+- 📊 **Risk Analysis**: Monitor risk rejections and position management
+- 🔔 **Notifications**: Real-time notification system for all trading events
+- 💹 **Trailing & Breakeven**: Visualize trailing stop/take and breakeven events
+- 🎨 **Material Design**: Beautiful UI with MUI 5 and Mantine components
+
+#### Use Case
+Perfect for monitoring your trading bots in production. Instead of building custom dashboards, `@backtest-kit/ui` provides a complete visualization layer out of the box. Each signal view includes detailed information forms, multi-timeframe candlestick charts, and JSON export for all data.
+
+#### Get Started
+```bash
+npm install @backtest-kit/ui backtest-kit ccxt
+```
+
+
+### @backtest-kit/mongo
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/mongo)** 💾
+
+The **@backtest-kit/mongo** package replaces the default file-based `./dump/` storage with MongoDB as the source of truth and Redis as an O(1) lookup cache. All 15 `IPersist*Instance` contracts from backtest-kit are implemented — strategy code stays unchanged.
+
+#### Key Features
+- 🗄️ **MongoDB Backend**: All 15 persistence adapters implemented with Mongoose and unique compound indexes
+- ⚡ **O(1) Reads via Redis**: Every context-key lookup goes through ioredis — one `GET` + one `findById`, no B-tree scans
+- 🔒 **Atomic Writes**: `findOneAndUpdate` with `upsert: true` guarantees read-after-write correctness with no race conditions
+- 🛡️ **Look-Ahead Bias Protection**: Adapters that affect signal logic store the simulation timestamp so backtest-kit can enforce temporal correctness
+- 🪦 **Soft Delete**: Measure, Interval, and Memory records carry a `removed` flag instead of being physically deleted
+- 🔌 **Zero Strategy Changes**: Drop `setup()` into your entry point, everything else stays the same
+
+#### Use Case
+Perfect for production deployments where the default file-based storage is a bottleneck or a reliability concern. During backtests, backtest-kit performs thousands of context-keyed reads per second — Redis eliminates the per-request B-tree traversal and makes repeated reads effectively free. MongoDB provides durability, atomic upserts, and a queryable signal history that survives process restarts.
+
+#### Get Started
+```bash
+npm install @backtest-kit/mongo backtest-kit mongoose ioredis
+```
+
+
+### @backtest-kit/ollama
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/ollama)** 🤖
+
+The **@backtest-kit/ollama** package is a multi-provider LLM inference library that supports 10+ providers including OpenAI, Claude, DeepSeek, Grok, Mistral, Perplexity, Cohere, Alibaba, Hugging Face, and Ollama with unified API and automatic token rotation.
+
+#### Key Features
+- 🔌 **10+ LLM Providers**: OpenAI, Claude, DeepSeek, Grok, Mistral, Perplexity, Cohere, Alibaba, Hugging Face, Ollama
+- 🔄 **Token Rotation**: Automatic API key rotation for Ollama (others throw clear errors)
+- 🎯 **Structured Output**: Enforced JSON schema for trading signals (position, price levels, risk notes)
+- 🔑 **Flexible Auth**: Context-based API keys or environment variables
+- ⚡ **Unified API**: Single interface across all providers
+- 📊 **Trading-First**: Built for backtest-kit with position sizing and risk management
+
+#### Use Case
+Ideal for building multi-provider LLM strategies with fallback chains and ensemble predictions. The package returns structured trading signals with validated TP/SL levels, making it perfect for use in `getSignal` functions. Supports both backtest and live trading modes.
+
+#### Get Started
+```bash
+npm install @backtest-kit/ollama agent-swarm-kit backtest-kit
+```
+
+
+### @backtest-kit/signals
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/signals)** 📊
+
+The **@backtest-kit/signals** package is a technical analysis and trading signal generation library designed for AI-powered trading systems. It computes 50+ indicators across 4 timeframes and generates markdown reports optimized for LLM consumption.
+
+#### Key Features
+- 📈 **Multi-Timeframe Analysis**: 1m, 15m, 30m, 1h with synchronized indicator computation
+- 🎯 **50+ Technical Indicators**: RSI, MACD, Bollinger Bands, Stochastic, ADX, ATR, CCI, Fibonacci, Support/Resistance
+- 📊 **Order Book Analysis**: Bid/ask depth, spread, liquidity imbalance, top 20 levels
+- 🤖 **AI-Ready Output**: Markdown reports formatted for LLM context injection
+- ⚡ **Performance Optimized**: Intelligent caching with configurable TTL per timeframe
+
+#### Use Case
+Perfect for injecting comprehensive market context into your LLM-powered strategies. Instead of manually calculating indicators, `@backtest-kit/signals` provides a single function call that adds all technical analysis to your message context. Works seamlessly with `getSignal` function in backtest-kit strategies.
+
+#### Get Started
+```bash
+npm install @backtest-kit/signals backtest-kit
+```
+
+
+### @backtest-kit/sidekick
+
+> **[Explore on NPM](https://www.npmjs.com/package/@backtest-kit/sidekick)** 🚀
+
+The **@backtest-kit/sidekick** package scaffolds a project where **all wiring is visible and editable** in your project files — exchange adapter, frame definitions, risk rules, strategy logic, and the runner script. Think of it as the **eject** of `@backtest-kit/cli --init`: instead of the boilerplate being hidden inside the CLI package, it lives directly in your project.
+
+#### Key Features
+- 🚀 **Zero Config**: Get started with one command - no setup required
+- 📦 **Complete Template**: Includes backtest strategy, risk management, and LLM integration
+- 🤖 **AI-Powered**: Pre-configured with DeepSeek, Claude, and GPT-5 fallback chain
+- 📊 **Technical Analysis**: Built-in 50+ indicators via @backtest-kit/signals
+- 🔑 **Environment Setup**: Auto-generated .env with all API key placeholders
+- 📝 **Best Practices**: Production-ready code structure with examples
+
+#### Use Case
+The fastest way to bootstrap a new trading bot project. Instead of manually setting up dependencies, configurations, and boilerplate code, simply run one command and get a working project with LLM-powered strategy, multi-timeframe technical analysis, and risk management validation.
+
+#### Get Started
+```bash
+npx -y @backtest-kit/sidekick my-trading-bot
+cd my-trading-bot
+npm start
+```
+
+
+## 👪 Community
+
+### backtest-monorepo-parallel
+
+> **[Explore on GitHub](https://github.com/backtest-kit/backtest-monorepo-parallel)** 🏎️
+
+The **backtest-monorepo-parallel** repository is a TypeScript monorepo template that runs **9 symbols in parallel** in a single Node process on top of shared Mongo + Redis infrastructure, with a self-enforcement runtime that exposes the workspace DI container to `./content/` strategy files. No wiring, no bundler hooks, no strategy-author changes.
+
+#### Key Features
+- ⚡ **~6 300× Real-Time Aggregate**: 9 symbols × ~703× per-symbol replay speed, ~103 events/sec in the hot `listenActivePing → commitAverageBuy` loop on a commodity i5-13420H laptop
+- 🧵 **Single-Process Concurrency**: All 9 `Backtest.background(...)` contexts share one event loop, one Mongo pool, one Redis pool — no IPC, no fork overhead
+- 💉 **DI Surface**: Workspace services typed via rolled-up `types.d.ts` and reachable from strategy files at evaluation time
+- 🗂️ **Mode A / Mode B**: `--entry` flag toggles between parallel runner (`CC_SYMBOL_LIST` fan-out) and single-strategy CLI mode
+- 🧩 **Linear Scaling Recipe**: Adding a service = +1 file, +1 symbol, +1 provider, +1 ioc entry — no churn under `./content/`
+
+#### Use Case
+Use when you need to backtest many symbols concurrently against the same strategy without spawning subprocesses, and want a scaffold where new services, collections, and Redis caches drop in alongside existing ones without restructuring. Ideal as the starting point for a production parallel-symbol backtesting setup.
+
+#### Get Started
+```bash
+git clone https://github.com/backtest-kit/backtest-monorepo-parallel.git
+```
+
+
+### backtest-ollama-crontab
+
+> **[Explore on GitHub](https://github.com/backtest-kit/backtest-ollama-crontab)** 🐠
+
+The **backtest-ollama-crontab** repository is a TypeScript monorepo template that wires a cloud/local **Ollama** into a trading-signal pipeline as a risk filter, with a **15-minute crontab** ingesting signals from any public Telegram channel. The **same code runs in both live and backtest modes** — the crontab re-polls live and pulls the entire frame at startup in backtest.
+
+#### Key Features
+- 🤖 **Local/Cloud LLM Risk Filter**: Per-signal verdict from local Ollama (`gpt-oss` quantized) returning `riskAction: "skip" | "follow"`, with empirical rules embedded in the system prompt and tunable without recompiling packages
+- ⏰ **Crontab-Driven Ingestion**: `Cron.register(..., interval: "15m")` for live re-polling of the Telegram channel, plus a fire-once `Cron.register(...)` (no `interval`) for backtest-time bulk prepare — same code path in both modes
+- 📡 **Telegram MTProto Crawler**: QR-code session auth, `iterMessages` pull from any public channel into a `parser-items` Mongo collection, regex extraction of `direction / entry / targets / stoploss` into `screen-items`
+- 🧠 **Outline-Based Risk Logic**: Risk outline ingests 1m/15m candles + a pre-computed metrics packet (`avgRangePct`, `momentum24hPct`) and produces a zod-validated verdict consumed by the strategy
+- 📈 **Reproducible Backtest Comparison**: same parsed-signal set, two backtests side-by-side — **+52.22% → +68.90%** total PNL, Sharpe **+0.309 → +0.512**, winrate **68% → 82%**, profit factor **2.73 → 6.37** with the LLM gate enabled
+
+#### Use Case
+Reference for integrating any local LLM into a backtest-kit pipeline as a signal filter, and for combining periodic crontab pulls (live) with one-shot bulk prepare (backtest) via the same `Cron.register` API.
+
+#### Get Started
+```bash
+git clone https://github.com/backtest-kit/backtest-ollama-crontab.git
+```
+
+
+### backtest-kit-redis-mongo-docker
+
+> **[Explore on GitHub](https://github.com/backtest-kit/backtest-kit-redis-mongo-docker)** 🐳
+
+The **backtest-kit-redis-mongo-docker** repository is a production-grade integration that replaces the default file-based `./dump/` persistence with **MongoDB** as the source of truth and **Redis** as an O(1) lookup cache, packaged with `docker-compose` for one-command deploys.
+
+#### Key Features
+- 🗂️ **15 Persist Adapters**: Full implementation of every `IPersist*Instance` contract (Candle, Signal, Schedule, Risk, Partial, Breakeven, Storage, Notification, Log, Measure, Interval, Memory, Recent, State, Session) on top of MongoDB + Redis
+- ⚛️ **Atomic Read-After-Write**: Single-round-trip `findOneAndUpdate` with unique compound indexes — no E11000 leaks under concurrent writes
+- ⚡ **Redis O(1) Cache**: Per-domain `*CacheService` over `ioredis` for context-key → id lookups; cache miss falls back to Mongo and backfills automatically
+- 🛡️ **Look-Ahead Bias Protection**: Indexed `when: Number` column on every signal-affecting schema, fed by backtest-kit 9.0+'s `when: Date` adapter argument
+- 🐳 **Docker Compose Stack**: Separate compose files for Mongo and Redis plus a main container with networks; configurable via `CC_MONGO_CONNECTION_STRING` / `CC_REDIS_*` env vars
+
+#### Use Case
+Drop-in persistence upgrade for any backtest-kit project that outgrows the default file-based `./dump/` layout — strategy code, runners, and the CLI entry point stay unchanged. Use it when you need durable storage, concurrent-safe writes, fast restart recovery, or a containerized deployment for live and paper trading.
+
+#### Get Started
+```bash
+git clone https://github.com/backtest-kit/backtest-kit-redis-mongo-docker.git
+```
+
+
+### backtest-kit-skills
+
+> **[Explore on GitHub](https://github.com/backtest-kit/backtest-kit-skills)** 🤖
+
+The **backtest-kit-skills** repository is a Claude Code agent skill and Mintlify documentation source for the backtest-kit framework — AI-assisted strategy writing, debugging help, and full API reference in one place.
+
+#### Key Features
+- 🤖 **Claude Code Skill**: Installed under `~/.claude/skills/backtest-kit/` — strategy generation, debugging, and API reference
+- 📖 **Mintlify Docs**: Full documentation site runnable locally
+- 🎯 **Strategy Generation**: Complete TypeScript files with all schema registrations and runner setup
+- 🐛 **Debugging Help**: Catches common mistakes (missing `await`, wrong TP/SL direction, top-level commit calls)
+- 📚 **API Reference**: All schemas, commit functions, event listeners, LLM integration, graph pipelines, and persistence adapters
+
+#### Use Case
+Install the skill once and get AI-assisted backtest-kit development inside Claude Code. The skill knows the full API surface — schemas, commit functions, event listeners, broker adapters — so you can describe what you want in plain language and get working TypeScript strategy code.
+
+#### Get Started
+```bash
+npx skills add https://github.com/backtest-kit/backtest-kit-skills
+```
+
+
+### uzse-backtest-app
+
+> **[Explore on GitHub](https://github.com/backtest-kit/uzse-backtest-app)** 📈
+
+The **uzse-backtest-app** repository is a reference implementation for running Pine Script strategies on regional stock exchanges not available on TradingView (UZSE, MSE, DSE, and others). It downloads raw trade history, builds Japanese candlesticks, and feeds them into backtest-kit via a custom MongoDB exchange adapter.
+
+#### Key Features
+- 🌍 **Off-TradingView Markets**: Works with any exchange that exposes trade history — no TradingView dependency
+- 🕯️ **Candle Builder**: Aggregates raw trades into 1m candles, fills intraday and non-trading day gaps, builds higher timeframes up to `1d`
+- 🗄️ **MongoDB Backend**: Idempotent import with unique index — re-runs never create duplicates
+- 🔌 **Custom Exchange Adapter**: Connects MongoDB candles to backtest-kit via `addExchangeSchema`
+- 📜 **Pine Script Support**: Full `@backtest-kit/pinets` integration — run any Pine Script v5/v6 indicator on local market data
+
+#### Use Case
+Perfect for traders working with emerging or regional markets absent from TradingView. Download trade history, build candles once, then use the full backtest-kit + Pine Script toolchain for backtesting and live signal generation — with no dependency on any third-party charting platform.
+
+#### Get Started
+```bash
+git clone https://github.com/backtest-kit/uzse-backtest-app.git
+```
+
+## 🧩 Strategy Examples
+
+#### 🧠 Neural Network Strategy (Oct 2021)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/oct_2021.strategy)
+
+Trains a feed-forward `TensorFlow` neural network (8→6→4→1 architecture) every 8 hours to predict where the next candle will close within its high-low range. When current price is below predicted price, opens a LONG with 1% trailing take-profit.
+
+#### 🌲 Pine Script Range Breakout (Dec 2025)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/dec_2025.strategy)
+
+Runs `btc_dec2025_range.pine` on 1h candles via `@backtest-kit/pinets`, extracting Bollinger Bands, range boundaries, and volume spikes. Signals fire only on confirmed breakouts when price hasn't already moved past the signal close.
+
+#### 🔪 Signal Inversion Strategy (Jan 2026)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/jan_2026.strategy)
+
+The strategy takes published signals from a real Telegram crypto channel (Crypto Yoda), enters at the same price zone and timestamp, but **inverts the direction** and uses the liquidity of the crowd that blindly follows the recommendation regardless of the contents of the order book.
+
+#### 📰 AI News Sentiment (Feb 2026)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/feb_2026.strategy)
+
+Every 4-8 hours, fetches live crypto/macro news via Tavily, passes headlines to Ollama (local LLM), and opens positions based on `bullish`/`bearish`/`wait` forecasts. Conflicting signals flip positions mid-trade. Achieved +16.99% during a -16.4% month.
+
+#### 🪂 SHORT DCA Ladder (Mar 2026)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/mar_2026.strategy)
+
+Opens a SHORT on every pending signal, then adds rungs (up to 10) whenever price spikes upward outside a ±1-5% band around last entry. Closes at 0.5% blended profit. 
+
+#### 🧗 LONG DCA Ladder (Apr 2026)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/apr_2026.strategy)
+
+Same mechanics as SHORT version but LONG-biased with 3% profit target. Deployed 2.4 entries per trade on average, achieved +67.85% PNL on deployed capital with improved percentage drawdown (-2.59% vs -3.99% without DCA).
+
+#### 🐍 Python EMA Crossover (Feb 2021)
+
+> Link to [the source code](https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/feb_2021.strategy)
+
+Python-based (WASI) strategy that uses EMA(9) and EMA(21) crossover signals executed via WebAssembly. Trades trigger when fast EMA crosses slow EMA, confirmed by 4h range midpoint.
+
+## 👨‍💼 Commercial Support
+
+> **[TheOneTrade](https://theonetrade.github.io)** 💼
+
+**TheOneTrade** is the commercial vendor behind backtest-kit, providing paid support, custom strategy development, managed accounts, team training, and enterprise licensing. Contact for SLAs, private features, or quant team engagements that fall outside the MIT-licensed open-source scope.
+
+## 🪐 See also
+
+Zero-dependency TypeScript ports of the quant math behind [vectorbt](https://github.com/polakowo/vectorbt) — same models, native to backtest-kit's `Exchange` schema, no Python runtime. Each estimates a different dimension of speculative pressure and plugs in independently:
+
+- **[garch](https://www.npmjs.com/package/garch)** — models conditional variance of log-returns (GARCH / EGARCH / GJR-GARCH / HAR-RV / NoVaS, auto-selected by QLIKE) to bound how far flow can push price next candle. Fitted `σ` → log-normal corridor `P·exp(±z·σ)` for TP/SL. Via `Exchange.getCandles`.
+
+- **[pump-anomaly](https://www.npmjs.com/package/pump-anomaly)** — detects coordinated speculation: cross-correlation + union-find author clustering separates real multi-actor inflow from one actor on many channels, volume z-scores score cascade pressure (pump vs stop-hunt). Returns an entry/exit plan, exits fitted by OHLC replay and screened against winner's-curse (DSR / PBO / SPA). Via `Exchange.getRawCandles` (pretrain model in past).
+
+- **[volume-anomaly](https://www.npmjs.com/package/volume-anomaly)** — quantifies order-flow intensity: Hawkes branching ratio (arrival clustering), CUSUM (imbalance shift), BOCPD (regime break) → composite outlier score as an entry-timing gate. Via `Exchange.getAggregatedTrades`.
+
+## 🤖 Are you a robot?
+
+**For language models**: Read extended description in [./LLMs.md](./LLMs.md)
+
+## ✅ Tested & Reliable
+
+775+ tests cover validation, recovery, reports, and events.
+
+## 🤝 Contribute
+
+Fork/PR on [GitHub](https://github.com/tripolskypetr/backtest-kit).
+
+## 📜 License
+
+MIT © [tripolskypetr](https://github.com/tripolskypetr)
+
