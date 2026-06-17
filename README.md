@@ -1565,6 +1565,112 @@ This change is part of a massive overhaul of the statistical suite. To ensure ev
 
 **Problem Solved:** Publishing astronomically high or mathematically impossible Sharpe/Sortino ratios due to tiny sample sizes, float-artifact standard deviations, or incorrect arithmetic averaging. The new engine includes strict gating thresholds (e.g., minimum 10 signals, minimum 14 calendar days) to return `N/A` instead of misleading numbers, ensuring that the metrics you base your financial decisions on are mathematically bulletproof.
 
+---
+
+## Parallel Multi-Asset Execution (Backtest & Live)
+
+Running multiple symbols sequentially or spawning a separate Node.js process for each ticker creates massive IPC overhead and wastes CPU cycles. Furthermore, coordinating shared state (like global risk limits or candle caches) across separate processes is an architectural nightmare.
+
+**The Solution:** Backtest Kit natively supports running dozens of symbols concurrently within a **single Node.js process** using `Backtest.background()` and `Live.background()`. All parallel contexts share the same V8 event loop, MongoDB connection pool, and Redis cache, eliminating IPC overhead while maintaining strict state isolation per symbol.
+
+**How It Works:**
+- **In-Memory Activity Registry (`Lookup`):** Tracks every in-flight backtest and live activity. The engine knows exactly how many workloads are running concurrently and manages their lifecycle.
+- **Cooperative Event-Loop Hand-Off (`Candle.spinLock`):** When fetching candles, the active backtest yields the event loop to peer workloads. This ensures multiple parallel calls progress in a fair, round-robin fashion instead of letting the first started symbol monopolize the CPU until completion.
+- **Shared Infrastructure:** Parallel runs share the same Mongo/Redis adapters, meaning candle caches and global risk state are instantly synchronized across all symbols without cross-process syncing.
+
+**Performance Metrics:**
+- **~6,300× Real-Time Aggregate:** Processing 9 symbols simultaneously on a commodity laptop (i5-13420H) achieves ~703× per-symbol replay speed.
+- **~103 Events/Second:** The hot loop (`listenActivePing → commitAverageBuy`) sustains high throughput in a single Node process.
+
+**Use Cases:**
+- **Portfolio-Wide Backtesting:** Test a strategy across the entire top-50 crypto market cap simultaneously.
+- **Live Multi-Asset Desks:** Run a single live bot that monitors and trades 20+ pairs, sharing a global risk profile to prevent over-leveraging the total account.
+- **Walker A/B Testing:** Evaluate multiple strategy variants across different symbols in parallel.
+
+---
+
+## Built-in Web Interface for Real-Time Transaction State Visualization
+
+Backtest Kit includes a powerful built-in web interface that provides **real-time visualization of transaction state graphs** — transforming abstract trading logic into an interactive, visual debugging experience.
+
+### Live State Machine Visualization
+
+The web interface renders the complete **signal lifecycle state machine** as an interactive graph, showing exactly where each transaction sits in its journey from `idle` → `scheduled` → `opened` → `active` → `closed`.
+
+**What You See:**
+- **Node-based graph** where each signal is a visual node
+- **Color-coded states**: Green for profitable positions, red for losses, yellow for pending, blue for active
+- **Real-time transitions**: Watch signals flow through states as market conditions change
+- **State transition history**: Click any node to see the complete audit trail of state changes
+
+**Example Visualization:**
+```
+[idle] ──signal generated──> [scheduled] ──price hit──> [opened]
+                                                      │
+                                                      ├──> [active] ──TP hit──> [closed: profit]
+                                                      │
+                                                      └──> [active] ──SL hit──> [closed: loss]
+```
+
+### Interactive Features
+
+**1. State Inspection Panel**
+Click any transaction node to reveal:
+- Current position size and entry price
+- Real-time PnL with fees/slippage calculated
+- Distance to take-profit and stop-loss levels
+- DCA entry history (if applicable)
+- Partial close execution log
+- Timestamp of last state transition
+
+**2. Filter & Search**
+- Filter by symbol (BTCUSDT, ETHUSDT, etc.)
+- Filter by strategy name
+- Filter by state (show only `active` positions, or only `closed` for post-analysis)
+- Search by signal ID or transaction hash
+
+**3. Time-Travel Debugging**
+- Scrub through historical backtest timeline
+- Watch the state graph evolve candle-by-candle
+- Pause at any moment to inspect exact state
+- Replay specific signals to understand decision logic
+
+**4. Multi-Symbol Portfolio View**
+- Aggregate view showing all symbols simultaneously
+- Heatmap overlay showing which symbols are generating the most signals
+- Correlation matrix showing how signals cluster across assets
+- Portfolio-level risk exposure visualization
+
+### Real-Time Metrics Dashboard
+
+The interface includes a live metrics panel showing:
+- **Active Positions**: Count and total capital deployed
+- **Pending Signals**: Waiting for price activation
+- **Closed Today**: Win rate and total PnL
+- **Risk Exposure**: Percentage of portfolio at risk
+- **Signal Velocity**: Signals per hour across all strategies
+
+### Export & Sharing
+
+- **Export graph as PNG/SVG** for presentations or documentation
+- **Export state history as JSON** for offline analysis
+- **Share permalink** to specific backtest moment (includes timestamp and symbol filters)
+- **Embed mode** for embedding the live graph in internal dashboards via iframe
+
+### Accessing the Interface
+
+```bash
+# Start backtest with UI
+npx @backtest-kit/cli --backtest ./strategy.ts --ui
+
+# Interface available at:
+http://localhost:60050
+```
+
+The web interface requires **zero configuration** — it auto-discovers registered strategies, exchanges, and symbols, presenting them in an intuitive navigation menu.
+
+---
+
 ## Conclusion
 
 Backtest Kit solves the fundamental challenges of building reliable trading systems through:
