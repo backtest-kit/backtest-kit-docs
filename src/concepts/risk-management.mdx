@@ -1,0 +1,321 @@
+---
+title: "Risk Management: Portfolio-Level Controls and Validation"
+sidebarTitle: "Risk Management"
+description: "Configure portfolio-level risk rules in Backtest Kit to enforce position limits, custom signal validators, and rejection tracking across all strategies."
+---
+
+Individual strategy logic only sees one symbol at a time. Without a layer above it, ten strategies each risking 10 % of capital can simultaneously open positions — creating 100 % total exposure with no single strategy aware of the others. Backtest Kit's risk management layer sits between signal generation and execution, evaluating every pending signal against the current portfolio state before allowing it to proceed. Because this check runs atomically, no race condition can allow two strategies to each believe they are safely within limits and both open at the same time.
+
+## Registering a Risk Schema with `addRiskSchema`
+
+`addRiskSchema` registers a named risk profile containing one or more validation functions. Any strategy can reference this profile by name in its schema, and the framework will run every validation in the profile against every signal that strategy attempts to open.
+
+```typescript
+import { addRiskSchema } from "backtest-kit";
+
+addRiskSchema({
+  riskName: "conservative_portfolio",
+  note: "Max 3 concurrent positions; skip signals outside London/NY session",
+  validations: [
+    {
+      note: "Hard cap: no more than 3 open positions across all strategies",
+      validate: async ({ activePositionCount }) => {
+        if (activePositionCount >= 3) {
+          return {
+            id: "max_positions",
+            note: `Position limit reached (${activePositionCount}/3 open)`,
+          };
+        }
+        // Returning undefined (or void) means the signal is allowed
+      },
+    },
+  ],
+});
+```
+
+The `validate` function receives an `IRiskValidationPayload` that includes:
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `currentSignal` | `ISignalDto | null` | Full signal details (entry, TP, SL, direction, cost) |
+| `currentPrice` | `number` | Market price at the time of the check |
+| `activePositionCount` | `number` | Total open positions across ALL strategies using this risk profile |
+| `activePositions` | `IRiskActivePosition[]` | Detailed list of every open position |
+| `symbol` | `string` | Symbol being checked |
+| `strategyName` | `string` | Strategy that generated the signal |
+| `timestamp` | `number` | Unix millisecond timestamp of the check |
+| `backtest` | `boolean` | Whether the check is running in backtest mode |
+
+Return an `IRiskRejectionResult` (`{ id, note }`) to reject the signal, or return nothing (or `undefined`) to allow it. Throwing an error also rejects the signal and surfaces the error through `listenValidation`.
+
+## Built-In Checks
+
+While all validation logic lives in your custom functions, the framework provides the building blocks for the most common portfolio controls:
+
+**Maximum concurrent positions** — compare `activePositionCount` against your threshold and return a rejection if the limit is reached.
+
+**Minimum risk/reward ratio** — calculate the R/R from the signal's `priceTakeProfit`, `priceStopLoss`, and `priceOpen`, and reject signals below your minimum.
+
+**Position size limits** — inspect `currentSignal.cost` against a maximum dollar amount per trade or a percentage of estimated portfolio balance.
+
+## Custom Validation Examples
+
+### Time-of-Day Restriction
+
+Restrict new entries to the London/New York overlap session (13:00–17:00 UTC):
+
+```typescript
+{
+  note: "Only open positions during high-liquidity London/NY overlap",
+  validate: async ({ timestamp }) => {
+    const hour = new Date(timestamp).getUTCHours();
+    if (hour < 13 || hour >= 17) {
+      return {
+        id: "time_filter",
+        note: `Signal outside session window (hour=${hour} UTC)`,
+      };
+    }
+  },
+}
+```
+
+### Minimum Risk/Reward Ratio
+
+Reject signals where the potential reward does not justify the risk:
+
+```typescript
+{
+  note: "Minimum 1.5 R/R ratio required",
+  validate: async ({ currentSignal }) => {
+    if (!currentSignal) return;
+    const { priceOpen, priceTakeProfit, priceStopLoss, position } = currentSignal;
+
+    const reward =
+      position === "long"
+        ? priceTakeProfit - priceOpen
+        : priceOpen - priceTakeProfit;
+
+    const risk =
+      position === "long"
+        ? priceOpen - priceStopLoss
+        : priceStopLoss - priceOpen;
+
+    if (risk <= 0) {
+      return { id: "invalid_sl", note: "Stop-loss does not define a risk distance" };
+    }
+
+    const rrRatio = reward / risk;
+    if (rrRatio < 1.5) {
+      return {
+        id: "low_rr",
+        note: `R/R ratio too low: ${rrRatio.toFixed(2)} (minimum 1.5)`,
+      };
+    }
+  },
+}
+```
+
+### Maximum Position Size
+
+Cap each trade at \$500:
+
+```typescript
+{
+  note: "Maximum $500 per trade",
+  validate: async ({ currentSignal }) => {
+    if (!currentSignal) return;
+    if (currentSignal.cost > 500) {
+      return {
+        id: "oversized",
+        note: `Trade cost $${currentSignal.cost} exceeds $500 limit`,
+      };
+    }
+  },
+}
+```
+
+### Volatility Filter
+
+Skip signals when the spread between TP and SL is unusually large (a proxy for high volatility):
+
+```typescript
+{
+  note: "Skip signals with ATR-implied volatility above 5%",
+  validate: async ({ currentSignal, currentPrice }) => {
+    if (!currentSignal) return;
+    const { priceOpen, priceTakeProfit } = currentSignal;
+    const spread = Math.abs(priceTakeProfit - priceOpen) / priceOpen;
+    if (spread > 0.05) {
+      return {
+        id: "high_volatility",
+        note: `TP spread ${(spread * 100).toFixed(1)}% exceeds 5% volatility cap`,
+      };
+    }
+  },
+}
+```
+
+## Atomic Check-and-Reserve
+
+Every signal passes through two steps before it is allowed to open a position:
+
+1. **Validation** — all `validate` functions in the risk profile are executed against the pending signal.
+2. **Reservation** — if validation passes, a placeholder is immediately added to the active-position count before the position record is written.
+
+The reservation step is critical for parallel execution: a second signal evaluated in the same tick sees the reserved slot and cannot slip through on a stale count. This guarantee means you never have to worry about two strategies racing to fill the last available slot — the framework enforces atomicity automatically.
+
+<Note>
+  After a successful reservation, the framework either confirms the position (if the broker adapter accepts the order) or rolls back the reservation (if the broker rejects it). The risk count is never left in an inconsistent state regardless of exchange failures.
+</Note>
+
+## Risk Rejection Events
+
+When a signal is rejected, the framework:
+
+1. **Logs the rejection** with the full payload — symbol, strategy, rejection reason, active position count, current price, and timestamp.
+2. **Emits a `RiskRejectionNotification`** that you can observe via `listenRisk`.
+3. **Continues strategy operation** — the strategy is not stopped or paused; it simply does not open a position for this tick.
+
+Subscribe to rejections for monitoring, alerting, or building rejection statistics:
+
+```typescript
+import { listenRisk } from "backtest-kit";
+
+listenRisk((rejection) => {
+  console.warn(
+    `[RISK REJECTED] ${rejection.symbol} @ ${rejection.strategyName}: ` +
+    `${rejection.rejectionNote} (active positions: ${rejection.activePositionCount})`
+  );
+});
+```
+
+After a backtest completes, rejection statistics are available in `Backtest.getReport()` under the risk section, broken down by symbol and strategy.
+
+## Full Risk Schema Example
+
+The following example wires up a complete risk schema with multiple validators and response callbacks:
+
+```typescript
+import {
+  addRiskSchema,
+  addStrategySchema,
+  listenRisk,
+} from "backtest-kit";
+
+// Define the risk profile
+addRiskSchema({
+  riskName: "standard_risk",
+  note: "3-position cap, 1.5 R/R minimum, session filter",
+
+  // Optional callbacks for allowed/rejected events
+  callbacks: {
+    onRejected: async (rejection) => {
+      console.warn(
+        `Signal rejected: ${rejection.rejectionNote} ` +
+        `[symbol=${rejection.symbol}, positions=${rejection.activePositionCount}]`
+      );
+    },
+    onAllowed: async ({ symbol, strategyName }) => {
+      console.info(`Signal allowed: ${strategyName} on ${symbol}`);
+    },
+  },
+
+  validations: [
+    {
+      note: "Enforce maximum 3 concurrent open positions",
+      validate: async ({ activePositionCount }) => {
+        if (activePositionCount >= 3) {
+          return {
+            id: "max_positions",
+            note: `Portfolio limit reached (${activePositionCount}/3)`,
+          };
+        }
+      },
+    },
+    {
+      note: "Require minimum 1.5:1 risk/reward ratio",
+      validate: async ({ currentSignal }) => {
+        if (!currentSignal) return;
+        const { priceOpen, priceTakeProfit, priceStopLoss, position } = currentSignal;
+
+        const reward =
+          position === "long"
+            ? priceTakeProfit - priceOpen
+            : priceOpen - priceTakeProfit;
+
+        const risk =
+          position === "long"
+            ? priceOpen - priceStopLoss
+            : priceStopLoss - priceOpen;
+
+        if (risk <= 0) {
+          return { id: "no_sl_distance", note: "Invalid SL distance" };
+        }
+
+        const rr = reward / risk;
+        if (rr < 1.5) {
+          return { id: "low_rr", note: `R/R ${rr.toFixed(2)} below 1.5 minimum` };
+        }
+      },
+    },
+    {
+      note: "Only trade during London/New York overlap (13:00–17:00 UTC)",
+      validate: async ({ timestamp }) => {
+        const hour = new Date(timestamp).getUTCHours();
+        if (hour < 13 || hour >= 17) {
+          return {
+            id: "off_hours",
+            note: `Outside trading session (UTC hour: ${hour})`,
+          };
+        }
+      },
+    },
+    {
+      note: "Cap individual trade size at $500",
+      validate: async ({ currentSignal }) => {
+        if (!currentSignal) return;
+        if (currentSignal.cost > 500) {
+          return {
+            id: "oversized_trade",
+            note: `Trade cost $${currentSignal.cost} exceeds $500 cap`,
+          };
+        }
+      },
+    },
+  ],
+});
+
+// Attach the risk profile to a strategy
+addStrategySchema({
+  strategyName: "conservative_long",
+  riskName: "standard_risk",   // <-- links the risk profile
+  getSignal: async (symbol, when, currentPrice) => {
+    // Signal generation logic here
+    return null;
+  },
+});
+
+// Monitor all rejections globally
+listenRisk((rejection) => {
+  console.log(
+    `[RISK] ${rejection.symbol} rejected — ${rejection.rejectionNote}`
+  );
+});
+```
+
+<Warning>
+  Multiple strategies can reference the same `riskName`. When they do, `activePositionCount` reflects the total open positions across **all** strategies sharing that profile — not just the one currently requesting a signal. This is intentional: the risk profile represents a shared portfolio constraint, not a per-strategy limit.
+</Warning>
+
+## Tracking Rejections Over Time
+
+After a backtest completes you can retrieve the full rejection history programmatically or through the auto-generated Markdown report. Each `RiskEvent` in the log contains:
+
+- `timestamp` — when the rejection occurred
+- `symbol` and `strategyName` — which strategy was blocked
+- `rejectionNote` — the human-readable reason from your validator
+- `activePositionCount` — portfolio state at the time
+- `currentPrice` — market price at the time of rejection
+- `backtest` — whether the event was from a simulation or live trading
+
+Use this data to audit whether your risk rules are calibrated correctly — too many rejections may mean your limits are too tight; too few may indicate the rules are not firing when they should.

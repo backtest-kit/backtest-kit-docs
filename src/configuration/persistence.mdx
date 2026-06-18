@@ -1,0 +1,240 @@
+---
+title: "Backtest Kit Persistence: File, MongoDB, and Redis"
+sidebarTitle: "Persistence"
+description: "Choose between file-based, MongoDB, and Redis storage in Backtest Kit. Call setup() from @backtest-kit/mongo for a production backend."
+---
+
+Every state mutation in Backtest Kit — opening a position, recording a partial close, updating a trailing stop — is written to a persistence layer before the operation is considered complete. The framework ships with a zero-configuration file-based backend that is safe for development and single-strategy deployments. When you move to production, you can swap that backend for MongoDB and Redis with a single `setup()` call and no changes to your strategy code.
+
+## Default File-Based Persistence
+
+Out of the box, Backtest Kit writes all state to local files using atomic operations. The write sequence is:
+
+1. Write the new state to a temporary file in the same directory.
+2. Rename the temporary file to the final location (atomic on all modern filesystems).
+3. Verify the write completed successfully.
+
+If the process crashes between steps 1 and 2, the temporary file is discarded on restart and the previous state is recovered unchanged. This means you can power-cycle the machine mid-trade and the framework will resume from the last consistent snapshot.
+
+**When file-based persistence is the right choice:**
+
+- Local development and strategy iteration
+- Single-symbol backtests on a developer machine
+- Quick paper trading experiments
+- Any scenario where zero infrastructure overhead matters more than queryability
+
+**Limitations to be aware of:**
+
+- No cross-process sharing — two Node.js processes cannot safely share the same file store.
+- No queryability — you cannot run ad-hoc queries against historical signal data.
+- Throughput degrades with very large portfolios because every symbol writes its own set of files.
+
+## When to Upgrade to MongoDB \+ Redis
+
+Consider switching to `@backtest-kit/mongo` when any of the following apply:
+
+- You are running live or paper trading in a Docker container and need state to survive container restarts.
+- You are backtesting more than a handful of symbols in parallel and want a shared candle cache.
+- You want to query historical signals, measure data, or agent answers from a database client.
+- You are running a monorepo where multiple strategies share the same MongoDB instance.
+- You need Redis-accelerated O(1) lookups to keep latency low during high-frequency live trading.
+
+## Installing `@backtest-kit/mongo`
+
+```bash
+npm install @backtest-kit/mongo
+```
+
+`@backtest-kit/mongo` depends on [Mongoose](https://mongoosejs.com/) for MongoDB access and [ioredis](https://github.com/redis/ioredis) for the Redis cache layer. Both are installed automatically as peer dependencies.
+
+## Configuring Persistence in `setup.config.ts`
+
+Call `setup()` inside `config/setup.config.ts`. The CLI loads this file once, before any module hooks or strategy code, and then hands full ownership of the persistence layer to whatever adapters you register:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup();
+```
+
+When you call `setup()` without arguments, it reads connection parameters from environment variables. Add the following to your `.env`:
+
+```env
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-kit
+CC_REDIS_HOST=127.0.0.1
+CC_REDIS_PORT=6379
+```
+
+### Explicit Connection Parameters
+
+If you prefer to keep credentials out of `.env` files or need to compute them at runtime, pass them directly to `setup()`:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup({
+  CC_MONGO_CONNECTION_STRING: 'mongodb://mongo:27017/mydb',
+  CC_REDIS_HOST: 'redis',
+  CC_REDIS_PORT: 6379,
+  CC_REDIS_PASSWORD: 'secret',
+});
+```
+
+Values passed explicitly always take precedence over environment variables.
+
+### Verifying the Connection Before the First Tick
+
+`setup()` registers the adapters synchronously but does not block until the connection is open. If your backtest reads data that must exist in MongoDB before the first signal fires, gate the run on a real connection using `loader.config`:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup();
+```
+
+```typescript
+// config/loader.config.ts
+import mongoose from 'mongoose';
+
+export default async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+  console.log('MongoDB connection verified — starting backtest');
+};
+```
+
+<Note>
+  `setup.config` is synchronous; `loader.config` is the place for `await`. The CLI loads them in order: `setup.config` first (side effects), then `loader.config` (awaited), then strategy modules.
+</Note>
+
+## The 15 Adapter Slots
+
+Backtest Kit splits its persistence surface into 15 independent contracts. `@backtest-kit/mongo` implements all of them. Each adapter covers a specific domain of framework state:
+
+| Adapter | What It Stores |
+| --- | --- |
+| **Candle** | Cached OHLCV candle data per symbol and interval |
+| **Signal** | Active signal state (position, entry, TP, SL, DCA history) |
+| **Schedule** | Scheduled signals waiting for price activation |
+| **Risk** | Risk profile state and rejection counters |
+| **Partial** | Partial profit and loss execution history per signal |
+| **Breakeven** | Breakeven adjustment records per signal |
+| **Storage** | Arbitrary key-value session data scoped to a signal |
+| **Notification** | Dashboard and Telegram notification records |
+| **Log** | Structured JSONL log entries |
+| **Measure** | LLM responses, external API results, and memoized calculations |
+| **Interval** | Cron scheduler execution markers (processed time periods) |
+| **Memory** | Agent memory entries for LLM context continuity |
+| **Recent** | Most-recent signal lookup per (symbol, strategy, exchange, frame) |
+| **State** | Arbitrary state buckets scoped to a signal |
+| **Session** | Strategy-level session data scoped to (strategy, exchange, frame) |
+
+Candle records are **immutable** — the first write wins, and subsequent writes to the same `(symbol, interval, timestamp)` triplet are silently ignored via MongoDB's `$setOnInsert`. Every other adapter uses `$set`, so each write atomically replaces the previous value.
+
+## MongoDB Collections and Unique Indexes
+
+Each adapter maps to a dedicated MongoDB collection. The unique compound index ensures that upserts are idempotent — the framework can safely retry a write after a transient failure without creating duplicate records:
+
+| Collection | Unique Index Fields |
+| --- | --- |
+| `candle-items` | `symbol + interval + timestamp` |
+| `signal-items` | `symbol + strategyName + exchangeName` |
+| `schedule-items` | `symbol + strategyName + exchangeName` |
+| `risk-items` | `riskName + exchangeName` |
+| `partial-items` | `symbol + strategyName + exchangeName + signalId` |
+| `breakeven-items` | `symbol + strategyName + exchangeName + signalId` |
+| `storage-items` | `backtest + signalId` |
+| `notification-items` | `backtest + notificationId` |
+| `log-items` | `entryId` |
+| `measure-items` | `bucket + entryKey` |
+| `interval-items` | `bucket + entryKey` |
+| `memory-items` | `signalId + bucketName + memoryId` |
+| `recent-items` | `symbol + strategyName + exchangeName + frameName + backtest` |
+| `state-items` | `signalId + bucketName` |
+| `session-items` | `strategyName + exchangeName + frameName` |
+
+## How Redis Provides O(1) Lookups
+
+Each adapter maintains two internal layers: one that talks to MongoDB for durable storage, and one that talks to Redis for fast key lookups. When the strategy reads state for a given context key — for example, `(symbol, strategyName, exchangeName)` for a signal — the adapter checks Redis first:
+
+```text
+read signal for (BTCUSDT, my_strategy, binance)
+  │
+  ├─ Redis GET → hit  → MongoDB findById(_id)    ← two O(1) operations
+  │
+  └─ Redis GET → miss → MongoDB findOne(filter)
+                      → Redis SET (cache the _id)
+                      → return document
+```
+
+On a cache hit, the adapter performs two O(1) operations: one Redis `GET` and one MongoDB `findById`. On a cache miss, it falls back to a regular indexed MongoDB query, then writes the `_id` to Redis so every subsequent call is instant.
+
+Every write updates the Redis entry in the same round-trip, so a write followed immediately by a read always hits the cache with fresh data.
+
+## Soft Delete for Audit Trails
+
+Three adapters — **Measure**, **Interval**, and **Memory** — use soft delete instead of physically removing records. When you call `removeMeasureData()`, `removeIntervalData()`, or `removeMemoryData()`, the adapter sets `removed: true` on the document. All listing operations filter on `removed: false`, so removed records are hidden from active use while remaining in the database for audit purposes.
+
+This prevents race conditions that can arise from physical deletion and preserves the complete history of LLM responses, processed time periods, and agent memory entries for later analysis.
+
+## Utility Exports
+
+`@backtest-kit/mongo` exports several utilities for advanced use cases:
+
+| Export | Description |
+| --- | --- |
+| `setup(config?)` | Configure and register all 15 persistence adapters in one call. Reads from environment variables when `config` is omitted; explicit values always take precedence. |
+| `install()` | Register adapters only — use when configuration was already applied via `setConfig` or environment variables before this call. |
+| `setConfig(config)` | Override individual connection parameters after initial setup — for example, to switch databases between test runs in the same process. |
+| `getConfig()` | Returns the current merged configuration (environment variables plus any `setConfig` overrides). Useful for reading the active connection string at runtime. |
+| `getMongo()` | Returns the connected Mongoose instance (lazy singleton). Use this to run raw Mongoose queries against the same connection the framework uses. |
+| `getRedis()` | Returns the connected ioredis instance (lazy singleton). Use this to inspect or manipulate the Redis cache directly. |
+
+## Complete Example: `setup.config.ts` with MongoDB and Redis
+
+The following is a production-ready `config/setup.config.ts` that combines both connection styles and includes a companion `loader.config.ts` to gate the run on a verified connection:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+// All 15 persistence adapters are registered here.
+// The CLI will not register any adapters of its own.
+setup({
+  CC_MONGO_CONNECTION_STRING: process.env.CC_MONGO_CONNECTION_STRING
+    ?? 'mongodb://localhost:27017/backtest-kit',
+  CC_REDIS_HOST: process.env.CC_REDIS_HOST ?? '127.0.0.1',
+  CC_REDIS_PORT: Number(process.env.CC_REDIS_PORT ?? 6379),
+  CC_REDIS_PASSWORD: process.env.CC_REDIS_PASSWORD,
+});
+```
+
+```typescript
+// config/loader.config.ts
+import { getMongo, getRedis } from '@backtest-kit/mongo';
+
+export default async () => {
+  // getMongo() and getRedis() are lazy singletons — calling them
+  // triggers the connection if it hasn't been established yet.
+  const mongoose = getMongo();
+  await mongoose.connection.asPromise();
+
+  const redis = getRedis();
+  await redis.ping();
+
+  console.log('MongoDB + Redis connections verified — starting backtest');
+};
+```
+
+```env
+# .env
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-kit
+CC_REDIS_HOST=127.0.0.1
+CC_REDIS_PORT=6379
+```
+
+<Tip>
+  In Docker Compose, set `CC_MONGO_CONNECTION_STRING=mongodb://mongo:27017/backtest-kit` and `CC_REDIS_HOST=redis` to use the service hostnames instead of `localhost`.
+</Tip>

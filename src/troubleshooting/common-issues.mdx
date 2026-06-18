@@ -1,0 +1,428 @@
+---
+title: "Backtest Kit: How to Diagnose and Fix Common Issues"
+sidebarTitle: "Common Issues"
+description: "Fix look-ahead bias, live state desynchronization, memory leaks, and performance issues in Backtest Kit with step-by-step solutions."
+---
+
+Most problems in algorithmic trading frameworks fall into a small number of categories: data integrity issues that inflate backtest results, state management bugs that cause live positions to desync, and resource management mistakes that degrade performance over time. Backtest Kit is designed to prevent the majority of these at the type-system level, but some issues still arise from incorrect usage patterns. This page covers the most common ones, their root causes, and the steps to fix them.
+
+## Common Issues
+
+<AccordionGroup>
+  <Accordion title="Look-ahead bias: backtest results are unrealistically good">
+    **Symptoms**
+
+    Your backtest shows an extremely high win rate, a Sharpe ratio well above 2.0, or a PnL curve that looks nearly linear with no drawdown. Results collapse when you move to paper trading on the same period.
+
+    **Cause**
+
+    Look-ahead bias occurs when your strategy accesses data that would not have been available at the simulated timestamp — for example, fetching candles directly from a CCXT client inside `getSignal` instead of using the framework's candle retrieval functions, or reading a pre-computed array that contains future values.
+
+    The most common mistake is constructing a candle array outside the framework and passing future data in via a closure:
+
+    ```typescript
+    // ❌ Wrong — the candles array is constructed outside the framework
+    // and may contain future data
+    const allCandles = await exchange.fetchOHLCV('BTCUSDT', '1h', since, 1000);
+    
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      getSignal: async (symbol, when) => {
+        // This leaks future candles because allCandles is not time-bounded
+        const recentCandles = allCandles.filter(c => c.timestamp <= when.getTime());
+        // ...
+      },
+    });
+    ```
+
+    **Solution**
+
+    Always use the framework's data-fetching functions inside `getSignal`. The execution context provided by `AsyncLocalStorage` automatically enforces a temporal boundary — you cannot accidentally request data beyond the current simulation timestamp:
+
+    ```typescript
+    import { addStrategySchema, getCandles } from 'backtest-kit';
+    
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        // The framework enforces that only candles up to `when` are returned.
+        // Pending (incomplete) candles are excluded automatically.
+        const candles = await getCandles(symbol, '1h', 50);
+        // ...
+        return null;
+      },
+    });
+    ```
+
+    The framework aligns all candle requests to interval boundaries and excludes the currently-forming (pending) candle. If you are still seeing suspicious results after switching to framework data fetching, enable `--verbose` to inspect exactly which candles are being fetched on each tick.
+  </Accordion>
+
+  <Accordion title="State desynchronization: framework state doesn't match the exchange">
+    **Symptoms**
+
+    In live trading, the exchange shows an open position that the framework considers closed (or vice versa). Duplicate orders appear on the exchange. The bot places an opening order on a symbol that already has an active position.
+
+    **Cause**
+
+    Desynchronization occurs when an exchange API call succeeds but the framework's state update fails, or when the framework records a state change before the exchange confirms the order. This usually happens in one of two ways:
+
+    1. A `try/catch` block in the broker adapter silently swallows an exchange exception, causing the framework to record a state change that the exchange never executed.
+    2. The broker adapter does not throw on exchange rejection (e.g., insufficient margin), so the framework proceeds to mark the position as open even though no order was placed.
+
+    **Solution**
+
+    Let exceptions propagate from your adapter hooks. The framework's transactional guarantee handles rollback automatically:
+
+    ```typescript
+    // ❌ Wrong — swallowing the error causes a phantom state change
+    async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+      try {
+        await exchange.createOrder(/* ... */);
+      } catch (err) {
+        console.error(err); // Framework doesn't know this failed
+      }
+    }
+    ```
+
+    ```typescript
+    // ✅ Correct — let the exception propagate so the framework rolls back
+    async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+      // If this throws, the framework will NOT update its internal state.
+      // It will retry on the next candle tick.
+      await exchange.createOrder(/* ... */);
+    }
+    ```
+
+    Use the `--brokerdebug` flag to fire individual broker hooks in isolation and verify that your adapter correctly propagates exchange errors before deploying to live trading.
+  </Accordion>
+
+  <Accordion title="Memory leaks: heap usage grows continuously">
+    **Symptoms**
+
+    The Node.js process memory usage climbs steadily over hours or days of live trading. The garbage collector runs more frequently. Eventually the process runs out of memory or becomes noticeably sluggish.
+
+    **Cause**
+
+    Memory leaks in Backtest Kit strategies almost always come from one of two sources:
+
+    1. **Unbounded event listeners** — attaching a new `listenActivePing` or similar listener on every signal open without removing it on close. Each listener holds a closure that references the signal's data, and if listeners are never removed, the array grows indefinitely.
+    2. **Accumulating data in module-scope arrays** — storing candle or tick data in a top-level array that is never cleared. For multi-symbol strategies that run for months, this can accumulate gigabytes of data.
+
+    **Solution**
+
+    For event listeners, use the cleanup function returned by `listenActivePing` and related functions, or register listeners once at module level rather than inside `getSignal`:
+
+    ```typescript
+    // ❌ Wrong — registers a new listener on every signal open
+    addStrategySchema({
+      getSignal: async (symbol) => {
+        // This runs on every candle tick for an idle strategy
+        listenActivePing(async ({ symbol }) => {
+          // This listener is never removed
+        });
+        return null;
+      },
+    });
+    ```
+
+    ```typescript
+    // ✅ Correct — register listeners once at module level
+    listenActivePing(async ({ symbol, currentPrice }) => {
+      // This listener handles all active signals; no per-signal registration needed
+    });
+    ```
+
+    For data accumulators, use bounded queues with a fixed maximum size. Drop the oldest entries when the queue is full:
+
+    ```typescript
+    // ✅ Bounded ring buffer — holds at most 500 entries per symbol
+    const tickBuffer = new Map<string, number[]>();
+    
+    function recordTick(symbol: string, price: number) {
+      const buf = tickBuffer.get(symbol) ?? [];
+      buf.push(price);
+      if (buf.length > 500) buf.shift(); // drop oldest
+      tickBuffer.set(symbol, buf);
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Performance degradation: execution slows down over time">
+    **Symptoms**
+
+    A live strategy that initially processes each candle tick in milliseconds starts taking seconds per tick after running for a day or more. CPU usage climbs. The process falls behind the live market and processes candles late.
+
+    **Cause**
+
+    Performance degradation usually traces back to repeated expensive calculations that could be cached. Common examples:
+
+    - Fetching candles from the exchange on every tick even when the data hasn't changed.
+    - Recalculating technical indicators from scratch on every `listenActivePing` call instead of using the previous result as a starting point.
+    - Reconstructing a large data structure (e.g., a neural network model) on every signal evaluation.
+
+    **Solution**
+
+    Use `Cache.fn` to memoize expensive calculations at candle-interval boundaries. The cache key is derived from the execution context (symbol, timestamp, interval), so cached values are automatically invalidated when a new candle forms:
+
+    ```typescript
+    import { Cache, getCandles } from 'backtest-kit';
+    
+    // Cache.fn memoizes the result until the next candle boundary.
+    const computeIndicators = Cache.fn(async (symbol: string) => {
+      const candles = await getCandles(symbol, '1h', 100);
+      // Expensive EMA / RSI calculations happen once per candle, not once per tick.
+      const ema20 = computeEMA(candles, 20);
+      const rsi14 = computeRSI(candles, 14);
+      return { ema20, rsi14 };
+    });
+    
+    listenActivePing(async ({ symbol, currentPrice }) => {
+      // Second call within the same candle returns the cached result instantly.
+      const { ema20, rsi14 } = await computeIndicators(symbol);
+      // ...
+    });
+    ```
+
+    For model initialization, construct the model once at module level and reuse the instance across ticks:
+
+    ```typescript
+    // ✅ Constructed once at startup, reused on every tick
+    const model = await buildModel();
+    
+    addStrategySchema({
+      getSignal: async (symbol, when, currentPrice) => {
+        const prediction = await model.predict(/* ... */);
+        // ...
+      },
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="Default exchange doesn't support order book fetching in backtest mode">
+    **Symptoms**
+
+    Your strategy calls `getOrderBook()` during a backtest and receives an error like `getOrderBook is not supported for the default exchange schema` or returns empty data.
+
+    **Cause**
+
+    The default exchange schema registered by the CLI (CCXT Binance) does not implement historical order book fetching. Order book data is inherently real-time — there is no public API that returns the bid/ask depth at an arbitrary historical timestamp. The default schema only implements `getCandles`, which is sufficient for most strategies.
+
+    **Solution**
+
+    If your strategy genuinely needs order book data during backtest, you must register a custom exchange schema that implements `getOrderBook` with your own snapshot storage:
+
+    ```typescript
+    import { addExchangeSchema } from 'backtest-kit';
+    
+    addExchangeSchema({
+      exchangeName: 'my-exchange',
+      getCandles: async (symbol, interval, since, limit) => {
+        // ... CCXT candle fetching
+      },
+      getOrderBook: async (symbol, from, to) => {
+        // Return historical order book snapshots from your own data store.
+        // `from` and `to` are Date objects aligned to the configured offset window.
+        return myOrderBookStore.query(symbol, from, to);
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+    ```
+
+    If you are using order book data only for live trading (which is the common case), the default exchange works fine — just ensure you register your live exchange schema with a proper `getOrderBook` implementation in your `live.module.ts`.
+  </Accordion>
+
+  <Accordion title="Invalid signal errors: signal rejected during validation">
+    **Symptoms**
+
+    The framework logs a validation error and rejects a signal returned from `getSignal`. The strategy continues running but no position is opened.
+
+    **Cause**
+
+    Every signal passes through a validation pipeline before reaching the execution engine. Common validation failures:
+
+    - Take-profit (TP) and stop-loss (SL) prices are zero, negative, or undefined.
+    - For a `long` position: TP is below the entry price, or SL is above the entry price.
+    - For a `short` position: TP is above the entry price, or SL is below the entry price.
+    - The risk/reward ratio is below the configured minimum threshold.
+    - The signal was generated too recently relative to the configured interval throttle.
+    - `minuteEstimatedTime` is zero or negative.
+
+    **Solution**
+
+    Inspect the validation error message in the console or JSONL logs — it includes the specific field that failed. The most common fix is ensuring TP/SL are set correctly relative to the position direction:
+
+    ```typescript
+    // ✅ Correct signal structure for a long position
+    return {
+      position: 'long',
+      priceOpen: currentPrice,        // entry at current market price
+      priceTake: currentPrice * 1.03, // TP is 3% above entry (higher than entry for long)
+      priceStop: currentPrice * 0.98, // SL is 2% below entry (lower than entry for long)
+      cost: 100,                      // position size in quote currency
+      minuteEstimatedTime: 60 * 24,   // maximum time before signal is cancelled
+    };
+    ```
+
+    ```typescript
+    // ✅ Correct signal structure for a short position
+    return {
+      position: 'short',
+      priceOpen: currentPrice,
+      priceTake: currentPrice * 0.97, // TP is 3% below entry (lower than entry for short)
+      priceStop: currentPrice * 1.02, // SL is 2% above entry (higher than entry for short)
+      cost: 100,
+      minuteEstimatedTime: 60 * 24,
+    };
+    ```
+
+    Use `Position.bracket()` or `Position.moonbag()` to generate correctly structured signal fields from percentage inputs — they handle the directional math automatically and eliminate this class of validation error.
+  </Accordion>
+
+  <Accordion title="Candle cache miss: stale or missing cached data">
+    **Symptoms**
+
+    A backtest that previously ran quickly is now making live API calls on every tick. Or the cached data covers only part of the date range and the backtest fails partway through with a fetch error.
+
+    **Cause**
+
+    The candle cache is stored in `dump/data/candle/` relative to the strategy directory. Cache misses occur when:
+
+    - The cache has never been warmed for the requested interval (first run after adding a new `--cacheInterval`).
+    - The cache files were deleted (e.g., `--flush` was used or the directory was cleaned manually).
+    - `--noCache` was passed, which skips cache warming entirely.
+    - The backtest date range extends beyond what was cached in a previous run.
+
+    **Solution**
+
+    Run the backtest without `--noCache` to allow cache warming before the backtest starts. The CLI warms the cache for all intervals specified in `--cacheInterval` (default: `1m, 15m, 30m, 4h`) before the first tick:
+
+    ```bash
+    # Warm cache and run backtest
+    npx @backtest-kit/cli --backtest ./src/index.ts --symbol BTCUSDT
+    
+    # Add additional intervals to the cache warm-up
+    npx @backtest-kit/cli --backtest ./src/index.ts --symbol BTCUSDT \
+      --cacheInterval "1m, 15m, 1h, 4h, 1d"
+    ```
+
+    If you believe the cache contains stale data (e.g., the exchange re-published corrected historical candles), delete only the candle cache and re-warm it:
+
+    ```bash
+    # Remove just the candle cache, preserving reports and logs
+    rm -rf strategies/oct_2025/dump/data/candle/
+    
+    # Re-run to rebuild the cache
+    npx @backtest-kit/cli --backtest ./strategies/oct_2025/index.ts
+    ```
+
+    Use `--noCache` only when you want to skip the warm-up for a quick iteration and the data is already cached from a previous run.
+  </Accordion>
+
+  <Accordion title="Web dashboard not loading">
+    **Symptoms**
+
+    Navigating to `http://localhost:60050` returns a connection refused error or a blank page. The CLI output shows the strategy is running but there is no mention of the UI server starting.
+
+    **Cause**
+
+    The web dashboard only starts when you pass the `--ui` flag. Without it, the CLI does not launch the `@backtest-kit/ui` server, so no port is bound.
+
+    A secondary cause is a port conflict: if another process is already using port 60050, the server either fails to start or starts on a different address.
+
+    **Solution**
+
+    Ensure `--ui` is included in your command:
+
+    ```bash
+    npx @backtest-kit/cli --backtest ./src/index.ts --ui
+    ```
+
+    If port 60050 is in use, override it with the `CC_WWWROOT_PORT` environment variable:
+
+    ```env
+    # .env
+    CC_WWWROOT_PORT=60051
+    ```
+
+    Then navigate to `http://localhost:60051`. You can also change the bind address if you need the dashboard accessible from another machine on the network:
+
+    ```env
+    CC_WWWROOT_HOST=0.0.0.0
+    CC_WWWROOT_PORT=60050
+    ```
+
+    <Warning>
+      Binding to `0.0.0.0` exposes the dashboard on all network interfaces. Do not do this on a publicly accessible server without a firewall rule or reverse proxy with authentication.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Debugging Techniques
+
+Beyond fixing individual issues, these techniques help you understand what your strategy is doing during both backtests and live runs.
+
+### Enable Verbose Logging with `--verbose`
+
+The `--verbose` flag logs each candle fetch, including the symbol, interval, timestamp, and whether the data came from the cache or the exchange. This is the fastest way to confirm that your cache is being used correctly and to spot unexpected API calls:
+
+```bash
+npx @backtest-kit/cli --backtest ./src/index.ts --symbol BTCUSDT --verbose
+```
+
+Verbose output also logs every state transition, so you can trace exactly how a signal moves from `idle` → `scheduled` → `opened` → `active` → `closed`.
+
+### Use the Web Dashboard for Real-Time Signal Inspection
+
+The web dashboard at `http://localhost:60050` (when `--ui` is active) provides a live view of every signal's current state, its PnL, the distance to TP and SL, and the DCA entry history. Click any signal node to open the inspection panel, which shows the complete audit trail of state transitions with timestamps.
+
+Use the filter controls to focus on a specific symbol or state — for example, showing only `active` positions during a live run or replaying `closed` positions from a completed backtest.
+
+### Use `--pnldebug` to Simulate Position PnL
+
+Before committing to a live trade, use `--pnldebug` to simulate what the PnL curve would look like for a given entry price and direction over the next N minutes:
+
+```bash
+# Simulate a short position entered at 64069.50 on 2025-02-25 for 2 hours
+npx @backtest-kit/cli --pnldebug \
+  --symbol BTCUSDT \
+  --priceopen 64069.50 \
+  --direction short \
+  --when "2025-02-25" \
+  --minutes 120
+```
+
+The output table shows the running PnL percentage, the peak profit reached, and the maximum drawdown for each minute. Save it to Markdown for sharing or archival:
+
+```bash
+npx @backtest-kit/cli --pnldebug \
+  --priceopen 64069.50 \
+  --direction short \
+  --when "2025-02-25" \
+  --minutes 120 \
+  --markdown
+```
+
+### Review Markdown Reports and JSONL Logs
+
+After each backtest, the framework writes output to the `dump/` directory inside your strategy folder:
+
+| Path | Contents |
+| --- | --- |
+| `dump/report/` | JSONL files with structured data for every closed signal — PnL, entry/exit prices, duration, partial close history |
+| `dump/log/log.jsonl` | Append-only structured log with every framework event |
+| `dump/markdown/` | Human-readable Markdown reports: summary, signal lifecycle, risk rejections, max drawdown |
+| `dump/agent/` | LLM conversation dumps (if your strategy uses `@backtest-kit/ollama`) |
+
+The JSONL logs are line-delimited JSON, which means you can query them with any tool that understands JSON:
+
+```bash
+# Find all signals that closed with more than 5% profit
+cat dump/report/*.jsonl | grep -v '^$' | jq 'select(.pnlPercent > 5)'
+
+# Count signals by close reason
+cat dump/report/*.jsonl | grep -v '^$' | jq -r '.closeReason' | sort | uniq -c | sort -rn
+```
+
+The Markdown reports are generated automatically at the end of each backtest run and include summary statistics (total PnL, win rate, Sharpe ratio, max drawdown) alongside per-signal tables. These are the fastest way to evaluate a new strategy variant.

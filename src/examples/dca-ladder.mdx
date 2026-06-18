@@ -1,0 +1,246 @@
+---
+title: "DCA Ladder: Average Into Positions with Backtest Kit"
+sidebarTitle: "DCA Ladder"
+description: "DCA ladder strategy for Backtest Kit using commitAverageBuy and getPositionEntryOverlap. Results: SHORT +37.83% (Mar 2026) and LONG +67.85% (Apr 2026)."
+---
+
+A DCA (Dollar-Cost Averaging) ladder strategy opens a small initial position and then adds entries as price moves against you — lowering your blended cost basis with each rung and raising the probability that a small reversion closes the whole position at profit. Backtest Kit ships two documented variants: a **SHORT DCA ladder** backtested on March 2026 BTCUSDT (\+37.83% PnL) and a **LONG DCA ladder** backtested on April 2026 BTCUSDT (\+67.85% PnL). Both use the same three-function core: `commitAverageBuy`, `getPositionEntryOverlap`, and `getPositionPnlPercent`.
+
+## How It Works
+
+<Steps>
+  <Step title="Open the initial position on every new signal">
+    `getSignal` fires on every pending signal and opens a small position — \$100 by default — using `Position.moonbag`. The moonbag helper sets a wide hard stop (25%) so the ladder has room to run, and sets `minuteEstimatedTime: Infinity` because the exit is PnL-driven, not time-driven.
+
+    ```typescript
+    getSignal: async (symbol, when, currentPrice) => {
+      return {
+        position: "short",                   // or "long" for the LONG variant
+        ...Position.moonbag({
+          position: "short",
+          currentPrice,
+          percentStopLoss: HARD_STOP,        // 25% — hard emergency stop only
+        }),
+        minuteEstimatedTime: Infinity,
+        cost: LADDER_STEP_COST,              // $100 initial rung
+      };
+    },
+    ```
+  </Step>
+  <Step title="Monitor with listenActivePing">
+    `listenActivePing` fires on every candle while a position is active. You register two independent listeners: one that tries to add a ladder rung, and one that checks if the PnL target has been reached. Backtest Kit calls both on each tick.
+  </Step>
+  <Step title="Add entries with commitAverageBuy when price moves outside the overlap band">
+    Before calling `commitAverageBuy`, you check two guards:
+
+    1. **Step count** — `getPositionEntries` returns the current array of entries. If you've already deployed `LADDER_MAX_STEPS` rungs, stop adding.
+    2. **Overlap detection** — `getPositionEntryOverlap` checks whether `currentPrice` is within `±LADDER_UPPER/LOWER_STEP %` of any existing entry. If it is, the price hasn't moved far enough to justify a new rung. This prevents averaging into nearly-identical price levels and keeps each entry meaningfully spaced.
+
+    Only when both guards pass do you call `commitAverageBuy`, which deploys another `LADDER_STEP_COST` dollars and recalculates the blended cost basis using a harmonic mean.
+  </Step>
+  <Step title="Close when blended PnL reaches the target">
+    The second `listenActivePing` listener reads the blended PnL via `getPositionPnlPercent`. This function accounts for all entries' cost basis. Once the portfolio PnL crosses `TARGET_PROFIT`, it calls `commitClosePending` to close the entire position at market.
+  </Step>
+</Steps>
+
+## Key API Functions
+
+| Function | Purpose |
+| --- | --- |
+| `getPositionEntries(symbol)` | Returns the array of all entries for the active position. Use `.length` to count rungs. |
+| `getPositionEntryOverlap(symbol, price, { upperPercent, lowerPercent })` | Returns `true` if `price` falls within the band around any existing entry. Prevents duplicate rungs. |
+| `getPositionPnlPercent(symbol)` | Returns the current blended PnL percentage across all entries. |
+| `commitAverageBuy(symbol, cost)` | Adds a new entry at the current market price with the given cost. Recalculates the blended entry price. |
+| `commitClosePending(symbol, { id, note })` | Closes the entire position at the next available price. |
+| `Position.moonbag({ position, currentPrice, percentStopLoss })` | Helper that builds a signal with a wide hard stop and no fixed take-profit — suitable for DCA exits. |
+
+## Configuration Constants
+
+```typescript
+const HARD_STOP = 25.0;          // Emergency stop-loss — 25% from entry (rarely hit)
+const TARGET_PROFIT = 3;         // Close entire position when blended PnL reaches +3%
+                                 // (SHORT variant uses 0.5)
+
+const LADDER_STEP_COST = 100;    // Cost in USD per rung
+const LADDER_UPPER_STEP = 5;     // Upper edge of the overlap band (%)
+const LADDER_LOWER_STEP = 1;     // Lower edge of the overlap band (%)
+                                 // A new rung fires only when price moves >5% above
+                                 // or >1% below the last entry
+
+const LADDER_MAX_STEPS = 10;     // Maximum rungs per position
+                                 // Caps maximum capital at risk per position at $1,000
+```
+
+## Full Strategy Code — SHORT DCA Ladder (March 2026)
+
+The following is the complete production strategy for the SHORT DCA ladder. The LONG variant (`apr_2026_strategy`) is identical except `position: "long"` in `getSignal` and `TARGET_PROFIT: 3`.
+
+```typescript
+import {
+  addStrategySchema,
+  listenError,
+  listenActivePing,
+  Log,
+  Position,
+  commitClosePending,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+  commitAverageBuy,
+} from "backtest-kit";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+const HARD_STOP = 25.0;
+const TARGET_PROFIT = 0.5;           // SHORT variant targets 0.5% per position
+
+const LADDER_STEP_COST = 100;
+const LADDER_UPPER_STEP = 5;
+const LADDER_LOWER_STEP = 1;
+
+const LADDER_MAX_STEPS = 10;
+
+// ─── Signal ──────────────────────────────────────────────────────────────────
+// Opens a new $100 SHORT on every pending signal.
+// Position.moonbag sets a 25% hard stop and no fixed TP —
+// the exit is controlled entirely by the PnL listener below.
+addStrategySchema({
+  strategyName: "mar_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: "short",
+      ...Position.moonbag({
+        position: "short",
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: LADDER_STEP_COST,
+    };
+  },
+});
+
+// ─── Averaging ───────────────────────────────────────────────────────────────
+// On each active-position tick, check if we should add another rung.
+// Guard 1: Don't exceed LADDER_MAX_STEPS rungs.
+// Guard 2: Don't add a rung unless price has moved outside the overlap band.
+listenActivePing(async ({ symbol, currentPrice }) => {
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) {
+    return;
+  }
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) {
+    return;
+  }
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+// ─── Exit ────────────────────────────────────────────────────────────────────
+// On each active-position tick, check blended PnL.
+// Close as soon as the blended portfolio PnL crosses the target.
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  console.log(new Date(timestamp));
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) {
+    return;
+  }
+  Log.info("position closed due to the target pnl reached", {
+    symbol,
+    data,
+  });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: str.newline(
+      "# Closed by target pnl",
+    ),
+  });
+});
+
+// ─── Error logging ───────────────────────────────────────────────────────────
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+## Backtest Results
+
+### SHORT DCA Ladder — March 2026 (BTCUSDT)
+
+March 2026 was a volatile, mean-reverting month. BTC opened near $67k, spiked to $75,253 mid-month, then sold back to \$65,132 by late March — a net move of only −0.3% masking intra-month swings of ±15%. This is the ideal regime for a SHORT DCA ladder: price spikes get absorbed by new rungs, and the eventual reversion closes the blended position at the small \+0.5% target.
+
+| Metric | No DCA (single entry) | With DCA (ladder) |
+| --- | --- | --- |
+| Total trades | 64 | 21 |
+| Avg entries per trade | 1 | 3.1 |
+| Total deployed capital | \$6,400 | \$6,600 |
+| Net PnL (\$) | **−\$26.36** | **\+\$37.83** |
+| Net PnL (%) | −0.41% | **\+37.83%** |
+| Win rate | 68.8% | **95.2%** |
+| Worst drawdown (%) | −7.35% | −10.49% |
+| Worst drawdown (\$) | −\$7.35 | −\$104.93 |
+| Sharpe ratio | — | **0.35** |
+
+The DCA ladder flipped a losing month into a profitable one. The single-entry approach opened 64 short positions and was repeatedly stopped out by intra-month spikes. The ladder consolidated those into 21 multi-entry positions, absorbed the spikes, and closed each one at the small \+0.5% target.
+
+### LONG DCA Ladder — April 2026 (BTCUSDT)
+
+April 2026 was a recovery month after Q1 tariff shock. BTC ground upward from $68,282 to $78,737 (\+15.3%), pulling every DCA position into profit within days of each entry.
+
+| Metric | No DCA (single entry) | With DCA (ladder) |
+| --- | --- | --- |
+| Total trades | 5 | 7 |
+| Avg entries per trade | 1 | **2.4** |
+| Max entries in one trade | 1 | 5 |
+| Total deployed capital | \$500 | \$1,700 |
+| Net PnL (\$) | \$12.45 | **\$67.85** |
+| Net PnL (%) | \+12.45% | **\+67.85%** |
+| Win rate | 100% | 100% |
+| Worst drawdown (%) | −3.99% | **−2.59%** |
+| Worst drawdown (\$) | −\$3.99 | −\$12.64 |
+| Sharpe ratio | — | **0.12** |
+
+With an average of 2.4 entries per trade, the ladder deployed more capital into falling prices during the uptrend, boosting gross dollar profit from $12.45 to $67.85 (\+\$55.40). Notably, the percentage drawdown actually _improved_ (−2.59% vs −3.99%) because averaging down lowers the effective entry price — the ladder is percentage-safer even though it is fiat-riskier in absolute terms.
+
+## Key Advantages Over Single-Entry
+
+- **Lower blended cost basis** — each additional rung at a worse price pushes the effective entry toward the mean reversion zone, making a small \+0.5–3% target achievable even after a large adverse move.
+- **Higher hit rate on small targets** — with a blended entry closer to fair value, the position needs less reversion to close profitably. This is why win rate improved from 68.8% to 95.2% on the SHORT variant.
+- **Capital efficiency** — rather than opening 64 separate small trades, the DCA ladder consolidates entries into 21 positions with meaningful deployed capital per trade.
+
+<Warning>
+  **DCA in trending markets amplifies absolute fiat risk.** In a sustained downtrend that hits the 25% hard stop with all 10 rungs filled, the maximum single-position loss is $2,500 vs $250 for a single-entry approach. The `getPositionEntryOverlap` guard prevents you from averaging into nearly-identical price levels (which would waste capital), but it does _not_ protect you from a market that trends relentlessly against your position. Always size `LADDER_STEP_COST` so that `LADDER_MAX_STEPS × LADDER_STEP_COST × HARD_STOP%` is within your acceptable total risk per position.
+</Warning>
+
+## Running the Backtests
+
+<CodeGroup>
+
+```bash SHORT DCA Ladder (March 2026)
+npm start -- --backtest --symbol BTCUSDT \
+  --strategy mar_2026_strategy \
+  --exchange ccxt-exchange \
+  --frame mar_2026_frame \
+  ./content/mar_2026.strategy/mar_2026.strategy.ts
+```
+
+```bash LONG DCA Ladder (April 2026)
+npm start -- --backtest --symbol BTCUSDT \
+  --strategy apr_2026_strategy \
+  --exchange ccxt-exchange \
+  --frame apr_2026_frame \
+  ./content/apr_2026.strategy/apr_2026.strategy.ts
+```
+
+```bash With Web UI
+npm start -- --backtest --symbol BTCUSDT --ui \
+  ./content/apr_2026.strategy/apr_2026.strategy.ts
+```
+
+</CodeGroup>

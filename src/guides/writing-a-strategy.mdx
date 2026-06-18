@@ -1,0 +1,149 @@
+---
+title: "How to Write Your First Trading Strategy in Backtest Kit"
+sidebarTitle: "Write a Strategy"
+description: "Build a trading strategy with addStrategySchema, getSignal, and event listeners — covering exchange setup, signal logic, and position management."
+---
+
+Every Backtest Kit strategy follows the same declarative pattern: register your infrastructure schemas, describe what a signal looks like, and attach event listeners to manage open positions. The framework handles scheduling, state transitions, persistence, and look-ahead bias prevention automatically. This guide walks you through each step using a real DCA ladder strategy that you can run immediately.
+
+## Before You Start
+
+Make sure you have `backtest-kit` and `@backtest-kit/cli` installed in your project:
+
+```bash
+npm install backtest-kit @backtest-kit/cli ccxt
+```
+
+All strategy code lives in a single entry-point file (`.ts`, `.mjs`, or `.cjs`). The CLI picks it up at runtime — no build step required.
+
+---
+
+---
+
+## Complete Strategy Example: LONG DCA Ladder
+
+The following is the full DCA ladder strategy from the Backtest Kit production examples. It achieved **\+67.85% PnL** in the April 2026 backtest period using an average of 2.4 entries per trade.
+
+```typescript
+import {
+  addStrategySchema,
+  listenActivePing,
+  listenError,
+  Log,
+  Position,
+  commitClosePending,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+  commitAverageBuy,
+} from "backtest-kit";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+const HARD_STOP = 25.0;
+const TARGET_PROFIT = 3;
+
+const LADDER_STEP_COST = 100;
+const LADDER_UPPER_STEP = 5;
+const LADDER_LOWER_STEP = 1;
+
+const LADDER_MAX_STEPS = 10;
+
+addStrategySchema({
+  strategyName: "apr_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: "long",
+      ...Position.moonbag({
+        position: "long",
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: LADDER_STEP_COST,
+    };
+  },
+});
+
+listenActivePing(async ({ symbol, currentPrice }) => {
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) {
+    return;
+  }
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) {
+    return;
+  }
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  console.log(new Date(timestamp));
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) {
+    return;
+  }
+  Log.info("position closed due to the target pnl reached", {
+    symbol,
+    data,
+  });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: str.newline(
+      "# Closed by target pnl",
+    ),
+  });
+});
+
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+Run it against April 2026 data:
+
+```bash
+npx @backtest-kit/cli --backtest ./strategy.ts --symbol BTCUSDT
+```
+
+---
+
+## Signal Validation Rules
+
+Before any signal reaches the execution engine, the framework validates it automatically. You don't write validation code — invalid signals are rejected and logged, so your strategy continues without crashing.
+
+**The framework checks that:**
+
+- TP and SL prices are positive numbers
+- For a `long`: `priceTakeProfit > entryPrice > priceStopLoss`
+- For a `short`: `priceStopLoss > entryPrice > priceTakeProfit`
+- The risk/reward ratio meets the configured minimum threshold
+- The signal doesn't violate interval throttling (only one open position per strategy per symbol at a time)
+
+<Warning>
+  If your `getSignal` returns a signal with logically reversed TP/SL levels — for example, a stop-loss above the entry on a LONG — the framework rejects it silently. Always use `Position.moonbag()` or `Position.bracket()` to generate exit levels from percentage distances rather than computing raw prices by hand.
+</Warning>
+
+---
+
+## Logging with `Log`
+
+`Log.info` and `Log.debug` attach structured messages to the currently active signal, making them visible in the web dashboard and JSONL logs alongside the position they relate to.
+
+```typescript
+import { Log } from "backtest-kit";
+
+// Attach an informational message to the active signal
+Log.info("DCA entry added", { symbol, step: 3, blendedEntry: 92400 });
+
+// Attach a debug-level message (filtered out in production dashboards by default)
+Log.debug("indicator snapshot", { rsi: 42.1, macd: -12.5 });
+```
+
+Use `Log.info` for events you want to see in the dashboard. Use `Log.debug` for verbose diagnostics you only need when troubleshooting.

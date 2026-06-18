@@ -1,0 +1,333 @@
+---
+title: "Run TradingView Pine Script in Node.js with pinets"
+sidebarTitle: "PineTS"
+description: "Execute Pine Script v5/v6 in Node.js with @backtest-kit/pinets. Load a .pine file, call getSignal(), and get a typed trading signal — zero rewriting."
+---
+
+`@backtest-kit/pinets` lets you run TradingView Pine Script v5/v6 indicators directly inside a Backtest Kit strategy — no rewriting, no manual port. You copy a `.pine` file from TradingView, point the library at it, and receive a typed `ISignalDto` back with the position direction, entry price, stop-loss, and take-profit. Under the hood, the package uses [PineTS](https://github.com/QuantForgeOrg/PineTS), an open-source Pine Script transpiler and runtime that guarantees zero look-ahead bias by aligning every indicator evaluation to the backtest timeline.
+
+## Installation
+
+```bash
+npm install @backtest-kit/pinets pinets backtest-kit
+```
+
+<Note>
+  `pinets` (no `@backtest-kit/` prefix) is the underlying PineTS runtime and must be installed alongside the adapter.
+</Note>
+
+## API Reference
+
+| Function | Description |
+| --- | --- |
+| `getSignal(source, opts)` | Run Pine Script and return a structured `ISignalDto` (position, TP/SL, estimated hold time) |
+| `run(source, opts)` | Run Pine Script and return raw plot data for all `plot()` calls |
+| `extract(plots, mapping)` | Extract the **latest bar** values from plots using a custom field mapping |
+| `extractRows(plots, mapping)` | Extract **all bars** as a timestamped row array using a custom field mapping |
+| `dumpPlotData(id, plots, name, dir)` | Dump plot data to Markdown files in a directory for debugging |
+| `usePine(Pine)` | Register a custom Pine constructor for advanced configurations |
+| `setLogger(logger)` | Configure a custom logger |
+| `File.fromPath(path)` | Load Pine Script source from a `.pine` file (reads are memoized) |
+| `Code.fromString(code)` | Use inline Pine Script code passed as a string |
+
+## Creating a Pine Script Indicator
+
+Create a `.pine` file in your project. For `getSignal` to parse the result automatically, your script must expose four named `plot()` calls: `"Signal"`, `"Close"`, `"StopLoss"`, and `"TakeProfit"`. An optional `"EstimatedTime"` plot sets the expected hold duration in minutes (default: 240).
+
+<Warning>
+  Each `plot()` that you want to extract must include `display=display.data_window`. Without this, the PineTS runtime will not surface the value for extraction.
+</Warning>
+
+```pine
+//@version=5
+indicator("EMA Cross Strategy — 1H timeframe")
+
+// Indicators
+rsi       = ta.rsi(close, 10)
+atr       = ta.atr(10)
+ema_fast  = ta.ema(close, 7)
+ema_slow  = ta.ema(close, 16)
+
+// Entry conditions
+long_cond  = ta.crossover(ema_fast, ema_slow)  and rsi < 65
+short_cond = ta.crossunder(ema_fast, ema_slow) and rsi > 35
+
+// Risk levels — 1.5× ATR stop, 3× ATR target (2:1 R/R)
+sl_long   = close - atr * 1.5
+tp_long   = close + atr * 3.0
+sl_short  = close + atr * 1.5
+tp_short  = close - atr * 3.0
+
+// Required plots
+plot(close,                                "Close",         display=display.data_window)
+plot(long_cond ? 1 : short_cond ? -1 : 0, "Signal",        display=display.data_window)
+plot(long_cond ? sl_long  : sl_short,     "StopLoss",      display=display.data_window)
+plot(long_cond ? tp_long  : tp_short,     "TakeProfit",    display=display.data_window)
+plot(60,                                  "EstimatedTime", display=display.data_window)
+```
+
+### Required plot contract
+
+| Plot name | Expected value | Description |
+| --- | --- | --- |
+| `"Signal"` | `1` / `-1` / `0` | Long / Short / No signal |
+| `"Close"` | `close` | Entry price |
+| `"StopLoss"` | price level | Stop-loss price |
+| `"TakeProfit"` | price level | Take-profit price |
+| `"EstimatedTime"` | minutes (number) | Expected hold duration — optional, defaults to 240 |
+
+## Using `getSignal()` in a Strategy
+
+Once your `.pine` file is ready, wire it into a Backtest Kit strategy with `getSignal`. The function fetches the correct candles for the requested symbol and timeframe, runs the Pine Script, and returns a fully typed signal object.
+
+```typescript
+import { File, getSignal } from '@backtest-kit/pinets';
+import { addStrategy } from 'backtest-kit';
+
+addStrategy({
+  strategyName: 'pine-ema-cross',
+  interval: '5m',
+  riskName: 'demo',
+
+  getSignal: async (symbol) => {
+    // File reads are memoized — the .pine file is parsed once per process
+    const source = File.fromPath('strategy.pine');
+
+    return await getSignal(source, {
+      symbol,
+      timeframe: '1h',
+      limit: 100,    // number of candles to feed into the script
+    });
+  },
+});
+```
+
+<Tip>
+  `File.fromPath` caches the parsed Pine Script in memory. You can safely call it on every `getSignal` invocation without a performance penalty — the file is read from disk only once per process lifetime.
+</Tip>
+
+## Inline Code Strategy
+
+If you prefer not to manage a separate file, pass Pine Script as a string using `Code.fromString`:
+
+```typescript
+import { Code, getSignal } from '@backtest-kit/pinets';
+import { addStrategy } from 'backtest-kit';
+
+const pineScript = `
+//@version=5
+indicator("RSI Mean-Reversion")
+
+rsi = ta.rsi(close, 14)
+atr = ta.atr(14)
+
+long_cond  = rsi < 30
+short_cond = rsi > 70
+
+plot(close,                                "Close",      display=display.data_window)
+plot(long_cond ? 1 : short_cond ? -1 : 0, "Signal",     display=display.data_window)
+plot(close - atr * 2,                     "StopLoss",   display=display.data_window)
+plot(close + atr * 3,                     "TakeProfit", display=display.data_window)
+`;
+
+addStrategy({
+  strategyName: 'pine-rsi-reversion',
+  interval: '15m',
+  riskName: 'demo',
+
+  getSignal: async (symbol) => {
+    const source = Code.fromString(pineScript);
+    return await getSignal(source, { symbol, timeframe: '15m', limit: 100 });
+  },
+});
+```
+
+## Custom Plot Extraction
+
+When `getSignal` isn't flexible enough — for example, when you want to read non-standard plots or apply transforms — use `run` followed by `extract` or `extractRows`.
+
+### `extract()` — latest bar snapshot
+
+```typescript
+import { File, run, extract } from '@backtest-kit/pinets';
+
+const source = File.fromPath('indicators.pine');
+
+const plots = await run(source, {
+  symbol: 'ETHUSDT',
+  timeframe: '1h',
+  limit: 200,
+});
+
+const data = await extract(plots, {
+  // Simple: map a plot name to a field
+  rsi:  'RSI',
+  macd: 'MACD',
+
+  // Advanced: look back N bars from the latest
+  prevRsi: {
+    plot:    'RSI',
+    barsBack: 1,
+  },
+
+  // Advanced: apply a transform to the raw value
+  trendStrength: {
+    plot:      'ADX',
+    transform: (v) => (v > 25 ? 'strong' : 'weak'),
+  },
+});
+
+// data = { rsi: 55.2, macd: 12.5, prevRsi: 52.1, trendStrength: 'strong' }
+```
+
+### `extractRows()` — full history as typed rows
+
+```typescript
+import { File, run, extractRows } from '@backtest-kit/pinets';
+
+const source = File.fromPath('indicators.pine');
+
+const plots = await run(source, {
+  symbol: 'ETHUSDT',
+  timeframe: '1h',
+  limit: 200,
+});
+
+const rows = await extractRows(plots, {
+  rsi:  'RSI',
+  macd: 'MACD',
+  prevRsi: { plot: 'RSI', barsBack: 1 },
+  trend:   { plot: 'ADX', transform: (v) => (v > 25 ? 'strong' : 'weak') },
+});
+
+// rows[0] = { timestamp: '2024-01-01T00:00:00.000Z', rsi: 48.3, macd: -2.1, prevRsi: null,  trend: 'weak' }
+// rows[1] = { timestamp: '2024-01-01T01:00:00.000Z', rsi: 52.1, macd: -1.5, prevRsi: 48.3,  trend: 'weak' }
+```
+
+### `extract()` vs `extractRows()`
+
+|  | `extract()` | `extractRows()` |
+| --- | --- | --- |
+| Returns | Single object (latest bar) | Array of objects (all bars) |
+| Missing value | `0` (fallback) | `null` |
+| `timestamp` field | No | Yes — ISO string from the bar's time |
+| `barsBack` | Looks back from the last bar | Looks back from each bar's own index |
+| Use case | Signal generation at the current bar | Dataset export, historical analysis |
+
+## The `--pine` CLI Flag
+
+You can run a `.pine` file directly from the Backtest Kit CLI without writing a strategy wrapper. This is useful for quickly checking indicator output against historical data.
+
+```bash
+npx backtest-kit --pine strategy.pine --symbol BTCUSDT --timeframe 1h
+```
+
+## Visual Pine Script Editor
+
+Backtest Kit ships with an embedded editor for `.pine` files. Launch it with the `--editor` flag:
+
+```bash
+npx backtest-kit --editor
+```
+
+The editor lets you write and preview Pine Script output interactively, without restarting the backtest process on every change.
+
+## Supported Intervals
+
+`@backtest-kit/pinets` supports all standard Backtest Kit timeframes: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`.
+
+## Complete Example
+
+The full walkthrough below shows the `.pine` file and the TypeScript strategy side by side.
+
+<CodeGroup>
+
+```pine strategy.pine
+//@version=5
+indicator("EMA Cross — production example")
+
+// Parameters
+fast_len = 7
+slow_len = 16
+rsi_len  = 10
+atr_len  = 10
+
+// Indicators
+rsi      = ta.rsi(close, rsi_len)
+atr      = ta.atr(atr_len)
+ema_fast = ta.ema(close, fast_len)
+ema_slow = ta.ema(close, slow_len)
+
+// Signals
+long_cond  = ta.crossover(ema_fast, ema_slow)  and rsi < 65
+short_cond = ta.crossunder(ema_fast, ema_slow) and rsi > 35
+
+// Risk levels (2:1 reward-to-risk)
+sl_long   = close - atr * 1.5
+tp_long   = close + atr * 3.0
+sl_short  = close + atr * 1.5
+tp_short  = close - atr * 3.0
+
+// Required plots — display.data_window is mandatory
+plot(close,                                "Close",         display=display.data_window)
+plot(long_cond ? 1 : short_cond ? -1 : 0, "Signal",        display=display.data_window)
+plot(long_cond ? sl_long  : sl_short,     "StopLoss",      display=display.data_window)
+plot(long_cond ? tp_long  : tp_short,     "TakeProfit",    display=display.data_window)
+plot(60,                                  "EstimatedTime", display=display.data_window)
+```
+
+```typescript strategy.ts
+import { File, getSignal } from '@backtest-kit/pinets';
+import { addStrategy } from 'backtest-kit';
+
+addStrategy({
+  strategyName: 'ema-cross-pine',
+  interval: '5m',
+  riskName: 'demo',
+
+  getSignal: async (symbol) => {
+    // Memoized — safe to call on every tick
+    const source = File.fromPath('strategy.pine');
+
+    return await getSignal(source, {
+      symbol,
+      timeframe: '1h',
+      limit: 100,
+    });
+  },
+});
+```
+
+</CodeGroup>
+
+## Debugging with Plot Dump
+
+When a strategy behaves unexpectedly, dump the raw plot data to Markdown files for offline inspection:
+
+```typescript
+import { File, run, dumpPlotData } from '@backtest-kit/pinets';
+
+const source = File.fromPath('strategy.pine');
+const plots  = await run(source, { symbol: 'BTCUSDT', timeframe: '1h', limit: 100 });
+
+// Writes Markdown tables to ./dump/ta/
+await dumpPlotData('signal-001', plots, 'ema-cross', './dump/ta');
+```
+
+## Type Safety
+
+`extract` and `extractRows` are generic functions. You can pass a type parameter to get a fully typed result:
+
+```typescript
+type MyData = {
+  rsi: number;
+  trendStrength: 'strong' | 'weak';
+};
+
+const data = await extract<MyData>(plots, {
+  rsi: 'RSI',
+  trendStrength: { plot: 'ADX', transform: (v) => (v > 25 ? 'strong' : 'weak') },
+});
+
+// data.rsi and data.trendStrength are fully typed
+```

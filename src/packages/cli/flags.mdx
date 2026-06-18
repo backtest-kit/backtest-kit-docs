@@ -1,0 +1,403 @@
+---
+title: "Complete @backtest-kit/cli Flags and Commands Reference"
+sidebarTitle: "CLI Flags"
+description: "Complete reference for all @backtest-kit/cli command-line flags: backtest, paper, live, walker, pine, editor, dump, init, flush, and more."
+---
+
+`@backtest-kit/cli` exposes a single binary that selects its behavior based on the flags you pass. Every mode is a boolean flag — you pick exactly one per invocation — and then layer optional modifier flags on top. All flag values shown are defaults; omit any flag to use its default.
+
+## Core Execution Flags
+
+These flags select the execution mode. Pass exactly one per invocation.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--backtest` | boolean | `false` | Run strategy against historical candle data using a registered `FrameSchema` |
+| `--paper` | boolean | `false` | Subscribe to live prices but never place real orders |
+| `--live` | boolean | `false` | Deploy a real trading bot via exchange API |
+| `--walker` | boolean | `false` | A/B compare multiple strategy variants on the same historical period |
+| `--main` | boolean | `false` | Run a custom entry point with the full CLI environment but no trading harness |
+
+**Positional argument (required for all trading modes):** the path to your strategy entry point file. Set it once in `package.json` scripts so you never type it on the command line.
+
+```json
+{
+  "scripts": {
+    "backtest": "npx @backtest-kit/cli --backtest ./src/index.mjs",
+    "paper":    "npx @backtest-kit/cli --paper    ./src/index.mjs",
+    "start":    "npx @backtest-kit/cli --live     ./src/index.mjs"
+  }
+}
+```
+
+## Backtest-Specific Flags
+
+Use these flags to control what the backtest runs and how it handles caching and output.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair to backtest |
+| `--strategy` | string | First registered | Strategy name from `addStrategySchema` |
+| `--exchange` | string | First registered | Exchange name from `addExchangeSchema` |
+| `--frame` | string | First registered | Frame name from `addFrameSchema` |
+| `--cacheInterval` | string | `"1m, 15m, 30m, 4h"` | Comma-separated list of intervals to pre-cache before the run |
+| `--noCache` | boolean | `false` | Skip candle cache warming entirely |
+| `--noFlush` | boolean | `false` | Keep existing `report`, `log`, `markdown`, and `agent` folders instead of deleting them before the run |
+| `--verbose` | boolean | `false` | Log each individual candle fetch to stdout |
+
+<Note>
+  Before every backtest the CLI removes the `report`, `log`, `markdown`, and `agent` sub-folders from the strategy's `dump/` directory. Pass `--noFlush` to keep existing output from a previous run. Candle cache (`dump/data/`) is never removed automatically.
+</Note>
+
+A fully-specified backtest script looks like this:
+
+```json
+{
+  "scripts": {
+    "backtest": "npx @backtest-kit/cli --backtest --symbol ETHUSDT --strategy my-strategy --exchange binance --frame feb-2024 --cacheInterval \"1m, 15m, 1h, 4h\" ./src/index.mjs"
+  }
+}
+```
+
+```bash
+npm run backtest
+```
+
+## Walker Flags
+
+Walker mode loads multiple strategy entry points and runs them all against the same historical period, then prints a ranked comparison report.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--walker` | boolean | `false` | Enable Walker A/B comparison mode |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair for all strategy variants |
+| `--cacheInterval` | string | `"1m, 15m, 30m, 4h"` | Intervals to pre-cache |
+| `--noCache` | boolean | `false` | Skip candle cache warming |
+| `--noFlush` | boolean | `false` | Keep existing output folders for each strategy |
+| `--verbose` | boolean | `false` | Log each candle fetch and strategy progress |
+| `--output` | string | `walker_{SYMBOL}_{TIMESTAMP}` | Base name for the output file (no extension) |
+| `--json` | boolean | `false` | Save `Walker.getData()` result as JSON to `./dump/<output>.json` |
+| `--markdown` | boolean | `false` | Save `Walker.getReport()` as Markdown to `./dump/<output>.md` |
+
+Pass each strategy variant as a separate positional argument:
+
+```bash
+npx @backtest-kit/cli --walker \
+  --symbol BTCUSDT \
+  --noCache \
+  --markdown \
+  --output feb_2026_comparison \
+  ./content/feb_2026_v1.strategy.ts \
+  ./content/feb_2026_v2.strategy.ts \
+  ./content/feb_2026_v3.strategy.ts
+# → ./dump/feb_2026_comparison.md
+```
+
+<Note>
+  If no frame is registered by any of the strategy files, the Walker falls back to the last 31 days from `Date.now()` and prints a console warning.
+</Note>
+
+**Output modes:** omit `--json` and `--markdown` to print the Markdown report to stdout. Pass `--json` to save raw data. Pass `--markdown` to save a formatted report file.
+
+## Multi-Symbol Mode (`--entry`)
+
+Use `--entry` to fan a single strategy out across many symbols in parallel, or to drive `*.background()` from a UI, database, or external API. Combine it with exactly one of `--backtest`, `--live`, `--paper`, or `--walker`.
+
+The CLI handles the environment boilerplate (`.env` loading, `--ui` / `--telegram` providers, module hooks, SIGINT shutdown) while your entry file decides the symbol set and calls `*.background()` directly.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--entry` | string | — | Path to your multi-symbol entry file (combine with a mode flag) |
+
+```bash
+npx @backtest-kit/cli --backtest --entry ./src/multi-symbol.mjs
+```
+
+```javascript
+// src/multi-symbol.mjs
+import {
+  addExchangeSchema,
+  addFrameSchema,
+  addStrategySchema,
+  Backtest,
+} from 'backtest-kit';
+import ccxt from 'ccxt';
+
+addExchangeSchema({ exchangeName: 'binance', getCandles: async (symbol, interval, since, limit) => {
+  const exchange = new ccxt.binance();
+  const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+  return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+    timestamp, open, high, low, close, volume,
+  }));
+}, formatPrice: (symbol, price) => price.toFixed(2), formatQuantity: (symbol, qty) => qty.toFixed(8) });
+
+addFrameSchema({ frameName: 'feb-2026', interval: '1m', startDate: new Date('2026-02-01'), endDate: new Date('2026-02-28') });
+addStrategySchema({ strategyName: 'my-strategy', interval: '15m', getSignal: async () => null });
+
+const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
+
+for (const symbol of symbols) {
+  Backtest.background(symbol, {
+    strategyName: 'my-strategy',
+    exchangeName: 'binance',
+    frameName: 'feb-2026',
+  });
+}
+```
+
+## Utility Modes
+
+These flags activate standalone tools that do not require a strategy entry point.
+
+### `--pine` — Run a PineScript Indicator
+
+Execute a local `.pine` file against real exchange data and print the results as a Markdown table. No TradingView account required.
+
+```bash
+npx @backtest-kit/cli --pine ./math/impulse_trend_15m.pine \
+  --symbol BTCUSDT \
+  --timeframe 15m \
+  --limit 180 \
+  --when "2025-09-24T12:00:00.000Z"
+```
+
+The CLI reads all `plot()` calls that use `display=display.data_window` as output columns. Column names come directly from those plot names.
+
+### `--editor` — Browser-Based PineScript Editor
+
+Open the visual PineScript editor in your default browser. The editor connects to a live exchange and updates the chart as you hit **▶ Run**.
+
+```bash
+npx @backtest-kit/cli --editor
+```
+
+The CLI loads `./modules/editor.module` (if it exists) to register your exchange schema, starts the `@backtest-kit/ui` server on port `60050`, and opens the browser automatically.
+
+### `--dump` — Fetch Raw Candles to File
+
+Fetch OHLCV candles from any registered exchange and save them to `./dump/`. No strategy file required.
+
+```bash
+npx @backtest-kit/cli --dump --symbol BTCUSDT --timeframe 15m --limit 500 \
+  --when "2026-02-28T00:00:00.000Z" \
+  --jsonl --output feb2026_btc
+# → ./dump/feb2026_btc.jsonl
+```
+
+### `--pnldebug` — Simulate Position PnL Minute by Minute
+
+Simulate a hypothetical position and print running PnL, peak profit, and maximum drawdown for each 1m candle. Useful for understanding price behaviour around a specific entry.
+
+```bash
+npx @backtest-kit/cli --pnldebug \
+  --symbol BTCUSDT \
+  --priceopen 64069.50 \
+  --direction short \
+  --when "2025-02-25" \
+  --minutes 120
+```
+
+### `--brokerdebug` — Test Broker Adapter Hooks
+
+Fire a single broker commit against your live broker adapter without running a full strategy. Use it to verify that your `brokerdebug.module` correctly wires up exchange calls.
+
+```bash
+npx @backtest-kit/cli --brokerdebug --commit signal-open --symbol BTCUSDT
+npx @backtest-kit/cli --brokerdebug --commit partial-profit --symbol ETHUSDT
+```
+
+### `--flush` — Delete Generated Output Folders
+
+Delete `report`, `log`, `markdown`, and `agent` sub-folders from one or more strategy `dump/` directories without touching the candle cache.
+
+```bash
+npx @backtest-kit/cli --flush \
+  ./content/feb_2026.strategy/index.ts \
+  ./content/mar_2026.strategy/index.ts
+```
+
+### `--init` — Scaffold a New Project
+
+Bootstrap a ready-to-use project directory. The target directory must not exist or must be empty.
+
+```bash
+npx @backtest-kit/cli --init --output my-trading-bot
+```
+
+### `--docker` — Scaffold a Docker Workspace
+
+Create a self-contained directory with `docker-compose.yaml` and a strategy entry point.
+
+```bash
+npx @backtest-kit/cli --docker --output my-docker-workspace
+```
+
+## UI and Notifications
+
+These flags are modifiers — combine them with any trading mode.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--ui` | boolean | `false` | Start the `@backtest-kit/ui` web dashboard at `http://localhost:60050` |
+| `--telegram` | boolean | `false` | Send formatted trade notifications with price charts to your Telegram channel |
+
+```bash
+# Backtest with dashboard and Telegram notifications
+npm run backtest -- --symbol BTCUSDT --ui --telegram
+
+# Live trading with dashboard only
+npm start -- --symbol BTCUSDT --ui
+```
+
+<Note>
+  `--telegram` requires `CC_TELEGRAM_TOKEN` and `CC_TELEGRAM_CHANNEL` in your `.env`. Customize the UI host and port via `CC_WWWROOT_HOST` and `CC_WWWROOT_PORT`.
+</Note>
+
+## Pine Script Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--pine` | boolean | `false` | Enable PineScript execution mode |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair |
+| `--timeframe` | string | `"15m"` | Candle interval |
+| `--limit` | string | `250` | Number of candles to fetch (must cover indicator warmup bars) |
+| `--when` | string | now | End date for the candle window — ISO 8601 or Unix ms |
+| `--exchange` | string | First registered | Exchange name; falls back to CCXT Binance |
+| `--output` | string | `.pine` file name | Output file base name without extension |
+| `--json` | boolean | `false` | Write plots as a JSON array to `<pine-dir>/dump/<output>.json` |
+| `--jsonl` | boolean | `false` | Write plots as JSONL to `<pine-dir>/dump/<output>.jsonl` |
+| `--markdown` | boolean | `false` | Write a Markdown table to `<pine-dir>/dump/<output>.md` |
+
+<Warning>
+  `--limit` must cover indicator warmup bars. Rows before warmup completes show `N/A` in the output.
+</Warning>
+
+A `package.json` script for regular Pine runs:
+
+```json
+{
+  "scripts": {
+    "pine": "npx @backtest-kit/cli --pine ./math/impulse_trend_15m.pine --symbol BTCUSDT --timeframe 15m --limit 180"
+  }
+}
+```
+
+## Dump Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--dump` | boolean | `false` | Enable candle dump mode |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair |
+| `--timeframe` | string | `"15m"` | Candle interval |
+| `--limit` | string | `250` | Number of candles to fetch |
+| `--when` | string | now | End date for the candle window — ISO 8601 or Unix ms |
+| `--exchange` | string | First registered | Exchange name; falls back to CCXT Binance |
+| `--output` | string | `{SYMBOL}_{LIMIT}_{TIMEFRAME}_{TIMESTAMP}` | Output file base name without extension |
+| `--json` | boolean | `false` | Write candles as a JSON array to `./dump/<output>.json` |
+| `--jsonl` | boolean | `false` | Write candles as JSONL to `./dump/<output>.jsonl` |
+
+The `dump/` directory is created in the current working directory. Omitting both `--json` and `--jsonl` prints candle rows to stdout.
+
+```json
+{
+  "scripts": {
+    "dump": "npx @backtest-kit/cli --dump --symbol BTCUSDT --timeframe 15m --limit 500 --jsonl"
+  }
+}
+```
+
+## PnL Debug Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--pnldebug` | boolean | `false` | Enable PnL debug mode |
+| `--priceopen` | number | — | Entry price (required) |
+| `--direction` | string | `"long"` | `long` or `short` |
+| `--when` | string | now | Start timestamp — ISO 8601 or Unix ms |
+| `--minutes` | string | `60` | Number of 1m candles to simulate |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair |
+| `--exchange` | string | First registered | Exchange name; falls back to CCXT Binance |
+| `--output` | string | `{SYMBOL}_{DIRECTION}_{PRICEOPEN}_{TIMESTAMP}` | Output file base name |
+| `--json` | boolean | `false` | Save results as JSON array to `./dump/<output>.json` |
+| `--jsonl` | boolean | `false` | Save results as JSONL to `./dump/<output>.jsonl` |
+| `--markdown` | boolean | `false` | Save results as a Markdown table to `./dump/<output>.md` |
+
+Each output row contains: `min` (minute offset), `timestamp`, `close`, `pnl%`, `peak%`, and `drawdown%`.
+
+```json
+{
+  "scripts": {
+    "pnldebug": "npx @backtest-kit/cli --pnldebug --symbol BTCUSDT --priceopen 64069.50 --direction short --when \"2025-02-25\" --minutes 120"
+  }
+}
+```
+
+## Broker Debug Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--brokerdebug` | boolean | `false` | Enable broker debug mode |
+| `--commit` | string | `"signal-open"` | The broker hook to fire |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair |
+| `--exchange` | string | First registered | Exchange name |
+
+**Available `--commit` values:**
+
+| Value | Broker Hook |
+| --- | --- |
+| `signal-open` | `onSignalOpenCommit` |
+| `signal-close` | `onSignalCloseCommit` |
+| `partial-profit` | `onPartialProfitCommit` |
+| `partial-loss` | `onPartialLossCommit` |
+| `average-buy` | `onAverageBuyCommit` |
+| `trailing-stop` | `onTrailingStopCommit` |
+| `trailing-take` | `onTrailingTakeCommit` |
+| `breakeven` | `onBreakevenCommit` |
+
+The CLI loads `./modules/brokerdebug.module`, fetches the last candle for `--symbol`, derives synthetic payload values from `currentPrice` (TP = \+2%, SL = -2%), calls the selected hook once, and exits with code `0` on success.
+
+Create a `modules/brokerdebug.module.ts` to register your broker adapter for testing:
+
+```typescript
+// modules/brokerdebug.module.ts
+import { Broker } from 'backtest-kit';
+import { myExchange } from './exchange.mjs';
+
+class MyBroker {
+  async onSignalOpenCommit({ symbol, priceOpen, position }) {
+    await myExchange.openPosition(symbol, position, priceOpen);
+  }
+  // add other hooks as needed
+}
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+## Common Workflow Scripts
+
+A single `package.json` that covers every common workflow:
+
+```json
+{
+  "scripts": {
+    "backtest":   "npx @backtest-kit/cli --backtest ./src/index.mjs",
+    "paper":      "npx @backtest-kit/cli --paper    ./src/index.mjs",
+    "start":      "npx @backtest-kit/cli --live --ui --telegram ./src/index.mjs",
+    "walker":     "npx @backtest-kit/cli --walker --symbol BTCUSDT --noCache ./content/v1.ts ./content/v2.ts",
+    "pine":       "npx @backtest-kit/cli --pine ./math/indicator.pine --symbol BTCUSDT --timeframe 15m --limit 250",
+    "editor":     "npx @backtest-kit/cli --editor",
+    "dump":       "npx @backtest-kit/cli --dump --symbol BTCUSDT --timeframe 15m --limit 500 --jsonl",
+    "pnldebug":   "npx @backtest-kit/cli --pnldebug --symbol BTCUSDT --priceopen 64069.50 --direction short --when \"2025-02-25\" --minutes 120",
+    "brokerdebug":"npx @backtest-kit/cli --brokerdebug --commit signal-open --symbol BTCUSDT",
+    "flush":      "npx @backtest-kit/cli --flush ./src/index.mjs"
+  }
+}
+```
+
+Run any mode with additional flags passed after `--`:
+
+```bash
+npm run backtest -- --symbol ETHUSDT --ui --telegram
+npm run start -- --symbol BTCUSDT
+```

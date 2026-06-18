@@ -1,0 +1,432 @@
+---
+title: "Build AI-Powered Algorithmic Trading Strategies with LLMs"
+sidebarTitle: "AI Strategies"
+description: "Integrate OpenAI, Claude, DeepSeek, and Ollama into Backtest Kit using @backtest-kit/signals and @backtest-kit/ollama for AI-driven signal generation."
+---
+
+AI-powered strategies in Backtest Kit work by feeding market data into a language model, parsing the model's structured response as a trading signal, and returning that signal from `getSignal` — exactly like any other strategy. The framework handles temporal safety, state persistence, and provider differences; you focus on prompt engineering and signal logic. This guide covers the complete workflow from data collection through LLM call to validated signal, plus the tools Backtest Kit provides to make each step production-ready.
+
+---
+
+## The AI Strategy Workflow
+
+Every AI-powered strategy follows the same five-phase pattern:
+
+1. **Fetch multi-timeframe candle data** — get 1h, 15m, 5m, and 1m candles with a single call each
+2. **Build context** — format the candles into a structured conversation the LLM can reason about
+3. **Call the LLM** — send the conversation to your provider of choice
+4. **Parse and validate the response** — enforce a Zod schema so the output matches the expected signal shape
+5. **Return the signal** — hand the validated object back to the framework, or return `null` to wait
+
+The framework's ambient temporal context guarantees that every `getCandles` call is anchored to the current simulation timestamp, making look-ahead bias structurally impossible.
+
+---
+
+## `@backtest-kit/signals`: Building LLM Context with `commitHistorySetup`
+
+`@backtest-kit/signals` provides `commitHistorySetup`, an all-in-one helper that fetches candles across four timeframes (1h, 15m, 5m, 1m), formats them into a structured message array, and attaches pre-computed technical indicators (RSI, MACD, Bollinger Bands, Stochastic, ATR, ADX, support/resistance levels). The result is a ready-to-use conversation array optimized for LLM context injection.
+
+Install the package first:
+
+```bash
+npm install @backtest-kit/signals
+```
+
+Then call it inside `getSignal`:
+
+```typescript
+import { commitHistorySetup } from "@backtest-kit/signals";
+
+// Inside getSignal — messages is a plain array you pass by reference:
+const messages = [];
+
+await commitHistorySetup(symbol, messages);
+// messages now contains { role, content } objects for all four timeframes
+// with OHLCV tables and pre-computed indicator summaries ready for LLM injection
+```
+
+`commitHistorySetup` accepts `symbol` and a mutable `messages` array. It pushes all timeframe data and indicator summaries into the array in-place. The formatted output includes human-readable OHLCV tables per timeframe and Markdown-formatted indicator summaries — structured to maximize the signal-to-noise ratio for trading-focused LLMs.
+
+---
+
+## `@backtest-kit/ollama`: Multi-Provider LLM Calls
+
+`@backtest-kit/ollama` provides a unified Higher-Order Function (HOF) API that wraps any of 11\+ LLM providers behind a consistent interface. You wrap your signal generation function with a provider HOF — the adapter handles API key management, request formatting, and response parsing.
+
+Install the package:
+
+```bash
+npm install @backtest-kit/ollama
+```
+
+**Supported providers:**
+
+| HOF | Provider |
+| --- | --- |
+| `deepseek()` | DeepSeek |
+| `claude()` | Anthropic Claude |
+| `gpt5()` / `gpt4o()` | OpenAI |
+| `grok()` | xAI Grok |
+| `mistral()` | Mistral |
+| `perplexity()` | Perplexity |
+| `cohere()` | Cohere |
+| `alibaba()` | Alibaba Qwen |
+| `hf()` | Hugging Face |
+| `ollama()` | Local Ollama instance |
+| `glm4()` | Zhipu AI GLM-4 |
+
+Switch providers by changing one line — your strategy code is unchanged:
+
+<CodeGroup>
+
+```typescript DeepSeek
+import { deepseek } from "@backtest-kit/ollama";
+
+const getSignal = deepseek(async (messages) => {
+  // your signal logic — receives messages array, returns signal
+}, "deepseek-chat", process.env.DEEPSEEK_API_KEY);
+```
+
+```typescript Claude
+import { claude } from "@backtest-kit/ollama";
+
+const getSignal = claude(async (messages) => {
+  // same signal logic, different provider
+}, "claude-opus-4-5", process.env.ANTHROPIC_API_KEY);
+```
+
+```typescript Ollama (local)
+import { ollama } from "@backtest-kit/ollama";
+
+const getSignal = ollama(async (messages) => {
+  // runs on your local Ollama instance, no API key needed
+}, "deepseek-v3.1:671b");
+```
+
+</CodeGroup>
+
+---
+
+## Structured Output Enforcement with Zod
+
+Raw LLM outputs are unpredictable. `@backtest-kit/ollama` supports enforcing a Zod schema on every response, automatically retrying if the model returns malformed output.
+
+```typescript
+import { z } from "zod";
+import { deepseek } from "@backtest-kit/ollama";
+import { addOutline } from "agent-swarm-kit";
+import { zodResponseFormat } from "openai/helpers/zod";
+import { CompletionName } from "@backtest-kit/ollama";
+
+const SignalSchema = z.object({
+  position: z.enum(["long", "short", "wait"]),
+  note: z.string(),
+  priceOpen: z.number().positive(),
+  priceTakeProfit: z.number().positive(),
+  priceStopLoss: z.number().positive(),
+  minuteEstimatedTime: z.number().min(1).max(360),
+});
+
+type SignalOutput = z.infer<typeof SignalSchema>;
+
+// Register the outline so the schema is injected into every LLM prompt
+addOutline<SignalOutput>({
+  outlineName: "SignalOutline",
+  completion: CompletionName.RunnerOutlineCompletion,
+  format: zodResponseFormat(SignalSchema, "position_decision"),
+  getOutlineHistory: async ({ history, param: messages = [] }) => {
+    await history.push(messages);
+  },
+  validations: [
+    {
+      validate: ({ data }) => {
+        if (data.position === "long" && data.priceStopLoss >= data.priceOpen) {
+          throw new Error("For LONG, stop-loss must be below entry price");
+        }
+        if (data.position === "short" && data.priceStopLoss <= data.priceOpen) {
+          throw new Error("For SHORT, stop-loss must be above entry price");
+        }
+      },
+    },
+  ],
+});
+```
+
+<Note>
+  The Zod schema is injected into the LLM prompt as a JSON schema description, so the model receives field-level hints about what each property means. Trading-specific descriptions (e.g., "stop-loss must be below entry for LONG") help the model generate valid signals on the first try, reducing retry overhead.
+</Note>
+
+---
+
+## Memory Adapters: Preserving LLM Reasoning Across Restarts
+
+By default, LLM context is discarded between process restarts. `writeMemory` lets you persist LLM reasoning and build a knowledge base that grows with each trade.
+
+```typescript
+import { writeMemory } from "backtest-kit";
+
+// Inside getSignal or listenActivePing:
+await writeMemory(symbol, {
+  content: "LLM reasoning: strong bullish momentum on 1h, MACD crossover confirmed on 15m",
+  timestamp: when,
+});
+```
+
+Memory entries survive process restarts when you use MongoDB persistence (`@backtest-kit/mongo`). They are soft-deleted rather than physically removed, so you retain a complete audit trail of every LLM decision.
+
+---
+
+## Token Rotation for Rate Limiting
+
+During intensive backtesting or live trading with multiple symbols, a single API key can exhaust its rate limit. Pass an array of API keys to distribute load automatically:
+
+```typescript
+import { ollama } from "@backtest-kit/ollama";
+
+const getSignal = ollama(
+  async (messages) => {
+    // signal logic
+  },
+  "deepseek-v3.1:671b",
+  // Round-robins through all keys automatically
+  ["key-1", "key-2", "key-3"]
+);
+```
+
+---
+
+## Complete AI Strategy Example
+
+This complete strategy demonstrates the full workflow: multi-timeframe data collection via `commitHistorySetup`, structured LLM call with a Zod schema, and position management via `listenActivePing`. It mirrors the February 2026 AI news sentiment strategy that achieved **\+16.99% PnL** during a month when BTC fell **-16.4%**.
+
+```typescript
+import {
+  addStrategySchema,
+  addExchangeSchema,
+  addFrameSchema,
+  listenActivePing,
+  listenError,
+  commitClosePending,
+  getPositionPnlPercent,
+  writeMemory,
+  Position,
+  Log,
+  Backtest,
+} from "backtest-kit";
+import { commitHistorySetup } from "@backtest-kit/signals";
+import { deepseek } from "@backtest-kit/ollama";
+import { z } from "zod";
+import { addOutline } from "agent-swarm-kit";
+import { zodResponseFormat } from "openai/helpers/zod";
+import { CompletionName } from "@backtest-kit/ollama";
+import { json } from "agent-swarm-kit";
+import ccxt from "ccxt";
+import { errorData, getErrorMessage } from "functools-kit";
+
+// ── Exchange ────────────────────────────────────────────────────────────────
+
+addExchangeSchema({
+  exchangeName: "binance",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit
+    );
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+// ── Frame ───────────────────────────────────────────────────────────────────
+
+addFrameSchema({
+  frameName: "feb-2026",
+  interval: "1m",
+  startDate: new Date("2026-02-01T00:00:00Z"),
+  endDate: new Date("2026-02-28T23:59:59Z"),
+});
+
+// ── Signal Schema ────────────────────────────────────────────────────────────
+
+const TradingSignalSchema = z.object({
+  position: z.enum(["long", "short", "wait"]),
+  note: z.string().describe("Technical justification for the signal"),
+  priceOpen: z.number().positive().describe("Entry price"),
+  priceTakeProfit: z.number().positive().describe(
+    "For LONG: must be above priceOpen. For SHORT: must be below priceOpen."
+  ),
+  priceStopLoss: z.number().positive().describe(
+    "For LONG: must be below priceOpen. For SHORT: must be above priceOpen."
+  ),
+  minuteEstimatedTime: z
+    .number()
+    .min(1)
+    .max(360)
+    .describe("Expected minutes to reach take-profit"),
+});
+
+type TradingSignal = z.infer<typeof TradingSignalSchema>;
+
+// Register the structured output outline
+addOutline<TradingSignal>({
+  outlineName: "TradingSignalOutline",
+  completion: CompletionName.RunnerOutlineCompletion,
+  format: zodResponseFormat(TradingSignalSchema, "trading_signal"),
+  getOutlineHistory: async ({ history, param: messages = [] }) => {
+    await history.push(messages);
+  },
+  validations: [
+    {
+      validate: ({ data }) => {
+        if (data.position === "long" && data.priceStopLoss >= data.priceOpen) {
+          throw new Error("LONG: stop-loss must be below entry");
+        }
+        if (data.position === "short" && data.priceStopLoss <= data.priceOpen) {
+          throw new Error("SHORT: stop-loss must be above entry");
+        }
+      },
+    },
+  ],
+});
+
+// ── Strategy ─────────────────────────────────────────────────────────────────
+
+// Wrap getSignal with DeepSeek context — provider can be swapped to claude(), ollama(), etc.
+const generateSignal = deepseek(
+  async (messages: { role: string; content: string }[]) => {
+    const { data } = await json<TradingSignal>("TradingSignalOutline", messages);
+    return data;
+  },
+  "deepseek-chat",
+  process.env.DEEPSEEK_API_KEY
+);
+
+addStrategySchema({
+  strategyName: "ai-multitimeframe",
+  interval: "5m", // Generate signals every 5 minutes
+  getSignal: async (symbol, when, currentPrice) => {
+    // 1. Build LLM context from multi-timeframe candle data and indicators
+    const messages: { role: string; content: string }[] = [
+      {
+        role: "system",
+        content: `
+          You are a professional cryptocurrency trader.
+          Analyze the provided multi-timeframe candle data and generate a trading signal.
+
+          Rules:
+          - Return position='wait' if there is no clear signal or timeframes conflict
+          - For LONG: priceTakeProfit > priceOpen > priceStopLoss
+          - For SHORT: priceStopLoss > priceOpen > priceTakeProfit
+          - Base entry/exit levels on S/R zones, Fibonacci levels, or Bollinger Bands
+          - minuteEstimatedTime must be between 1 and 360
+        `,
+      },
+    ];
+
+    await commitHistorySetup(symbol, messages);
+
+    messages.push({
+      role: "user",
+      content:
+        "Analyze all timeframes above and generate a trading signal. " +
+        "Only open a position when there is a clear, confirmed signal. " +
+        "If timeframes conflict or the trend is weak, return position: wait.",
+    });
+
+    // 2. Call LLM with structured output enforcement
+    const result = await generateSignal(messages);
+
+    // 3. Persist reasoning for audit and debugging
+    await writeMemory(symbol, {
+      content: `LLM signal: ${result.position} — ${result.note}`,
+      timestamp: when,
+    });
+
+    // 4. Return null if the LLM recommends waiting
+    if (result.position === "wait") {
+      return null;
+    }
+
+    return {
+      position: result.position,
+      priceTakeProfit: result.priceTakeProfit,
+      priceStopLoss: result.priceStopLoss,
+      cost: 200,
+      minuteEstimatedTime: result.minuteEstimatedTime,
+    };
+  },
+});
+
+// ── Position Management ───────────────────────────────────────────────────────
+
+const TRAILING_STOP_PERCENT = 1.0;
+
+listenActivePing(async ({ symbol }) => {
+  const pnl = await getPositionPnlPercent(symbol);
+  if (pnl > TRAILING_STOP_PERCENT) {
+    Log.info("trailing take triggered", { symbol, pnl });
+    await commitClosePending(symbol, {
+      id: "trailing-take",
+      note: "# Closed by trailing take",
+    });
+  }
+});
+
+// ── Error Handling ────────────────────────────────────────────────────────────
+
+listenError((error) => {
+  Log.debug("strategy error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+
+// ── Run ───────────────────────────────────────────────────────────────────────
+
+Backtest.background("BTCUSDT", {
+  strategyName: "ai-multitimeframe",
+  exchangeName: "binance",
+  frameName: "feb-2026",
+});
+```
+
+Run the backtest:
+
+```bash
+npx @backtest-kit/cli --backtest ./strategy.ts --symbol BTCUSDT \
+  --cacheInterval "1m, 5m, 15m, 1h"
+```
+
+---
+
+## Debugging LLM Conversations
+
+Every LLM call can be dumped to disk for inspection. Use `dumpSignal()` to save the complete conversation history — system prompt, each user/assistant turn, and the final structured output — to `./dump/strategy/{uuid}/`:
+
+```typescript
+import { dumpSignal } from "backtest-kit";
+import { v4 as uuid } from "uuid";
+
+// Inside getSignal, after the LLM call:
+const signalId = uuid();
+await dumpSignal(signalId, messages, result);
+// Creates ./dump/strategy/{uuid}/00_system_prompt.md,
+//         ./dump/strategy/{uuid}/01_user_message.md, etc.
+```
+
+This gives you full visibility into why the LLM chose a particular direction, which timeframe was most influential, and where prompt engineering improvements could sharpen signal quality.
+
+<Tip>
+  When iterating on prompts, run Walker mode with two strategy variants — one with your current prompt and one with the revised prompt — to get a statistically comparable A/B test on the same historical period.
+</Tip>

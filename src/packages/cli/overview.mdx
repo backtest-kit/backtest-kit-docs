@@ -1,0 +1,330 @@
+---
+title: "@backtest-kit/cli: Zero-Config CLI for Algorithmic Trading"
+sidebarTitle: "Overview"
+description: "Run backtests, paper trading, and live bots with @backtest-kit/cli. Handles candle caching, web dashboard, Telegram, and broker wiring with one command."
+---
+
+`@backtest-kit/cli` wraps the `backtest-kit` engine and resolves all infrastructure scaffolding automatically. Point it at your strategy file, choose a mode, and it handles exchange connectivity, candle caching, the web dashboard, and Telegram notifications — so you can focus on the strategy itself rather than the plumbing around it.
+
+## Installation
+
+Add `@backtest-kit/cli` to your project as a dependency:
+
+```bash
+npm install @backtest-kit/cli
+```
+
+Or run it once without installing using `npx`:
+
+```bash
+npx @backtest-kit/cli --backtest ./src/index.mjs
+```
+
+## Scaffold a New Project
+
+The fastest way to get a production-ready project is to use the `--init` flag. It creates a complete directory with an example strategy, PineScript indicator, module hooks, and all documentation fetched automatically.
+
+```bash
+npx @backtest-kit/cli --init --output backtest-kit-project
+cd backtest-kit-project
+npm install
+npm start -- --help
+```
+
+<Note>
+  The generated project includes a `CLAUDE.md` AI-agent guide, example strategies under `content/`, and a `scripts/fetch_docs.mjs` utility that downloads the latest library READMEs into `docs/lib/`. Run `npm run sync:lib` at any time to refresh them.
+</Note>
+
+## The Four Execution Modes
+
+Every strategy runs in one of four modes. You select the mode with a CLI flag and the rest of the infrastructure wires itself up.
+
+| Mode | CLI Flag | Description |
+| --- | --- | --- |
+| **Backtest** | `--backtest` | Run your strategy against historical candle data using a registered `FrameSchema`. Warms the candle cache before the run and clears old output folders automatically. |
+| **Paper** | `--paper` | Subscribe to live prices but never place real orders. Identical code path to live trading — safe for strategy validation before going live. |
+| **Live** | `--live` | Deploy a real trading bot. Requires exchange API keys in your `.env`. Every trade mutation passes through your broker adapter atomically — exchange rejection rolls back internal state. |
+| **Walker** | `--walker` | A/B compare multiple strategy variants against the same historical period. Prints a ranked comparison report so you can pick the best variant before deploying. |
+
+<Tip>
+  There is also a `--main` mode for running a custom entry point with the full CLI environment prepared (`.env`, setup/loader configs, graceful shutdown) but without any trading harness. Use it for one-off scripts like fetching external data or running migrations.
+</Tip>
+
+## Quick Start
+
+Wire up your modes in `package.json` scripts and point each one at your strategy entry point. The entry point itself only needs to register schemas — `@backtest-kit/cli` is purely the runner.
+
+<Steps>
+  <Step title="Install dependencies">
+    ```bash
+    npm install @backtest-kit/cli backtest-kit ccxt
+    ```
+  </Step>
+  <Step title="Add scripts to package.json">
+    ```json
+    {
+      "scripts": {
+        "backtest": "npx @backtest-kit/cli --backtest ./src/index.mjs",
+        "paper":    "npx @backtest-kit/cli --paper    ./src/index.mjs",
+        "start":    "npx @backtest-kit/cli --live     ./src/index.mjs"
+      },
+      "dependencies": {
+        "@backtest-kit/cli": "latest",
+        "backtest-kit": "latest",
+        "ccxt": "latest"
+      }
+    }
+    ```
+  </Step>
+  <Step title="Write your strategy entry point">
+    The entry point registers exchange, frame, and strategy schemas. The CLI imports this file and runs the appropriate mode around it.
+
+    ```javascript
+    // src/index.mjs
+    import { addStrategySchema, addExchangeSchema, addFrameSchema } from 'backtest-kit';
+    import ccxt from 'ccxt';
+    
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => {
+        const exchange = new ccxt.binance();
+        const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+        return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+          timestamp, open, high, low, close, volume,
+        }));
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+    
+    addFrameSchema({
+      frameName: 'feb-2024',
+      interval: '1m',
+      startDate: new Date('2024-02-01'),
+      endDate: new Date('2024-02-29'),
+    });
+    
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      getSignal: async (symbol) => {
+        // return a signal object or null
+        return null;
+      },
+    });
+    ```
+  </Step>
+  <Step title="Run your first backtest">
+    ```bash
+    npm run backtest -- --symbol BTCUSDT
+    ```
+
+    Add the web dashboard and Telegram alerts:
+
+    ```bash
+    npm run backtest -- --symbol BTCUSDT --ui --telegram
+    ```
+  </Step>
+</Steps>
+
+## Features Overview
+
+`@backtest-kit/cli` covers the full lifecycle from first idea to production bot without requiring you to write any infrastructure code.
+
+### Zero Config
+
+Run `npx @backtest-kit/cli --backtest ./strategy.mjs` and you are backtesting. No DI container, no project scaffold, no copy-pasted infrastructure. If your strategy doesn't register an exchange or frame, the CLI falls back to CCXT Binance and a default February 2024 frame and prints a console warning.
+
+### Auto Candle Cache
+
+Before every backtest, the CLI warms the OHLCV cache for all intervals listed in `--cacheInterval` (default: `"1m, 15m, 30m, 4h"`). On subsequent runs, cached data is used directly — no exchange API calls. Pass `--noCache` to skip warming entirely.
+
+### Web Dashboard (`--ui`)
+
+Add `--ui` to any mode to start the `@backtest-kit/ui` server. The interactive dashboard becomes available at:
+
+```text
+http://localhost:60050
+```
+
+Customize the host and port via the `CC_WWWROOT_HOST` and `CC_WWWROOT_PORT` environment variables.
+
+### Telegram Notifications (`--telegram`)
+
+Add `--telegram` to receive formatted HTML messages with 1m / 15m / 1h price charts for every position event — opened, closed, scheduled, cancelled, risk rejection, partial profit/loss, trailing stop/take, and breakeven.
+
+Requires `CC_TELEGRAM_TOKEN` and `CC_TELEGRAM_CHANNEL` in your `.env`:
+
+```env
+CC_TELEGRAM_TOKEN=your_bot_token_here
+CC_TELEGRAM_CHANNEL=-100123456789
+```
+
+### Graceful Shutdown
+
+The first `Ctrl+C` stops all active runs and cleans up every subscription. A second `Ctrl+C` force-quits the process tree. No hanging processes, no orphaned exchange connections.
+
+### Default Binance
+
+When your strategy does not call `addExchangeSchema`, the CLI automatically registers a CCXT Binance schema so you can start backtesting without any exchange boilerplate.
+
+<Warning>
+  The default exchange schema does not support order book fetching in backtest mode. If your strategy calls `getOrderBook()` during a backtest, you must register a custom exchange schema with your own snapshot storage.
+</Warning>
+
+## Module Hooks (Broker Adapter)
+
+Drop a mode-specific module file alongside your strategy and the CLI loads it automatically before the run starts. No manual wiring required — the file is a side-effect import that calls `Broker.useBrokerAdapter()`.
+
+| Mode | Module File | Loaded Before |
+| --- | --- | --- |
+| `--live` | `./modules/live.module.mjs` | `Live.background()` |
+| `--paper` | `./modules/paper.module.mjs` | `Live.background()` (paper) |
+| `--backtest` | `./modules/backtest.module.mjs` | `Backtest.background()` |
+| `--walker` | `./modules/walker.module.mjs` | `Walker.background()` |
+| `--main` | `./modules/main.module.mjs` | The custom entry point |
+| `--brokerdebug` | `./modules/brokerdebug.module.mjs` | Broker commit test |
+
+All of `.mjs`, `.cjs`, and `.ts` extensions are tried automatically. A missing module file is a soft warning, not an error.
+
+```javascript
+// modules/live.module.mjs
+import { Broker } from 'backtest-kit';
+import { myExchange } from './exchange.mjs';
+
+class MyBroker {
+  async onSignalOpenCommit({ symbol, priceOpen, direction }) {
+    await myExchange.openPosition(symbol, direction, priceOpen);
+  }
+
+  async onSignalCloseCommit({ symbol, priceClosed }) {
+    await myExchange.closePosition(symbol, priceClosed);
+  }
+}
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+## Programmatic API
+
+You can call `@backtest-kit/cli` directly from your own script without spawning a child process or parsing CLI flags. Import `run` and await it:
+
+```typescript
+import { run } from '@backtest-kit/cli';
+
+await run('backtest', {
+  entryPoint: './src/index.mjs',
+  symbol: 'ETHUSDT',
+  frame: 'feb-2024',
+  cacheInterval: ['1m', '15m', '1h'],
+  verbose: true,
+});
+```
+
+<CodeGroup>
+
+```typescript Backtest
+import { run } from '@backtest-kit/cli';
+
+await run('backtest', {
+  entryPoint: './src/index.mjs',
+  symbol: 'ETHUSDT',
+  frame: 'feb-2024',
+  cacheInterval: ['1m', '15m', '1h'],
+  verbose: true,
+});
+```
+
+```typescript Paper
+import { run } from '@backtest-kit/cli';
+
+await run('paper', {
+  entryPoint: './src/index.mjs',
+  symbol: 'BTCUSDT',
+});
+```
+
+```typescript Live
+import { run } from '@backtest-kit/cli';
+
+await run('live', {
+  entryPoint: './src/index.mjs',
+  symbol: 'BTCUSDT',
+  verbose: true,
+});
+```
+
+</CodeGroup>
+
+<Warning>
+  `run()` can be called only once per process. A second call throws `"Should be called only once"`.
+</Warning>
+
+The `mode` parameter accepts `"backtest"`, `"paper"`, or `"live"`. All `args` fields are optional and fall back to the same defaults as the CLI flags. The `entryPoint` path, `symbol`, `strategy`, `exchange`, and `frame` fields let you select exactly what to run without touching `package.json`.
+
+## Docker Support
+
+Use `--docker` to scaffold a self-contained Docker workspace with a `docker-compose.yaml` and a strategy entry point:
+
+```bash
+npx @backtest-kit/cli --docker --output my-docker-workspace
+```
+
+The Docker image entrypoint forwards all arguments to the CLI unchanged. You can pin mode and flags in the `command:` field of `docker-compose.yaml`, or pass them as environment variables at `docker-compose up` time:
+
+```bash
+MODE=live SYMBOL=BTCUSDT STRATEGY_FILE=./content/feb_2026/feb_2026.strategy.ts docker-compose up -d
+```
+
+The following environment variables are supported inside the Docker container:
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `MODE` | yes | — | `backtest` \| `live` \| `paper` \| `walker` |
+| `STRATEGY_FILE` | yes | — | Path to strategy entry point (relative to `working_dir`) |
+| `SYMBOL` | no | `BTCUSDT` | Trading pair |
+| `STRATEGY` | no | first registered | Strategy name |
+| `EXCHANGE` | no | first registered | Exchange name |
+| `FRAME` | no | first registered | Frame name (backtest only) |
+| `UI` | no | — | Any non-empty value enables `--ui` |
+| `TELEGRAM` | no | — | Any non-empty value enables `--telegram` |
+| `VERBOSE` | no | — | Any non-empty value enables `--verbose` |
+| `NO_CACHE` | no | — | Any non-empty value enables `--noCache` |
+| `NO_FLUSH` | no | — | Any non-empty value enables `--noFlush` |
+| `ENTRY` | no | — | Any non-empty value enables multi-symbol mode via `--entry` |
+
+## Environment Variables
+
+Create a `.env` file in your project root to configure runtime behaviour:
+
+```env
+# Telegram notifications (required for --telegram)
+CC_TELEGRAM_TOKEN=your_bot_token_here
+CC_TELEGRAM_CHANNEL=-100123456789
+
+# Web UI server (optional, defaults shown)
+CC_WWWROOT_HOST=0.0.0.0
+CC_WWWROOT_PORT=60050
+
+# Custom QuickChart service URL (optional)
+CC_QUICKCHART_HOST=
+```
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CC_TELEGRAM_TOKEN` | — | Telegram bot token (from @BotFather) |
+| `CC_TELEGRAM_CHANNEL` | — | Telegram channel or chat ID |
+| `CC_WWWROOT_HOST` | `0.0.0.0` | UI server bind address |
+| `CC_WWWROOT_PORT` | `60050` | UI server port |
+| `CC_QUICKCHART_HOST` | — | Self-hosted QuickChart instance URL |
+
+## Entry Point Formats
+
+The CLI auto-detects your strategy file's format and loads it with the right runtime — no flags needed.
+
+| Format | Extension | Runtime | Notes |
+| --- | --- | --- | --- |
+| TypeScript | `.ts` | `tsx` via `tsImport()` | No `tsc` compilation step needed |
+| ES Module | `.mjs` | Native `import()` | Supports top-level `await` |
+| CommonJS | `.cjs` | Native `require()` | For compiled or legacy projects |

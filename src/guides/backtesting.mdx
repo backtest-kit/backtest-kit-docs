@@ -1,0 +1,345 @@
+---
+title: "Running Backtests and Analyzing Strategy Performance"
+sidebarTitle: "Backtesting"
+description: "Run backtests with the Backtest Kit CLI or programmatic API, warm the candle cache, view reports, and use Walker mode for A/B strategy comparison."
+---
+
+Backtesting in Backtest Kit replays your strategy across historical candle data using the exact same code path that runs in live trading. There is no separate "backtest mode" to code against — the engine swaps in a simulated clock and a file-based candle adapter, then executes your `getSignal` and event listeners tick by tick. Everything from position management to PnL calculations runs identically in both modes.
+
+---
+
+## Running a Basic Backtest
+
+Point the CLI at your strategy file and pass a symbol. The CLI auto-discovers your registered exchange, frame, and strategy schemas:
+
+```bash
+npx @backtest-kit/cli --backtest ./strategy.ts --symbol BTCUSDT
+```
+
+Add `--ui` to open the real-time web dashboard at `http://localhost:60050` while the backtest runs:
+
+```bash
+npx @backtest-kit/cli --backtest ./strategy.ts --symbol BTCUSDT --ui
+```
+
+Wire it into `package.json` so you don't have to type the path every time:
+
+```json
+{
+  "scripts": {
+    "backtest": "npx @backtest-kit/cli --backtest ./src/index.ts --symbol BTCUSDT"
+  }
+}
+```
+
+```bash
+npm run backtest
+```
+
+### CLI Flags Reference
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--backtest` | boolean | `false` | Run a historical backtest |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair to simulate |
+| `--strategy` | string | first registered | Strategy name to use |
+| `--exchange` | string | first registered | Exchange schema name |
+| `--frame` | string | first registered | Frame schema name |
+| `--cacheInterval` | string | `"1m, 15m, 30m, 4h"` | Comma-separated intervals to pre-cache before the run |
+| `--noCache` | boolean | `false` | Skip candle cache warming |
+| `--noFlush` | boolean | `false` | Keep existing report/log/markdown folders from previous runs |
+| `--verbose` | boolean | `false` | Log every candle fetch to the console |
+| `--ui` | boolean | `false` | Start the web dashboard on port `60050` |
+| `--telegram` | boolean | `false` | Send trade event notifications via Telegram |
+
+---
+
+## Cache Warming
+
+Before replaying candles, the CLI warms a local candle cache for every interval listed in `--cacheInterval`. On subsequent runs the cache is read from disk — no exchange API calls, no rate limit concerns, and dramatically faster iteration.
+
+```bash
+# First run: fetches candles from Binance and writes to ./dump/data/candle/
+npx @backtest-kit/cli --backtest ./strategy.ts --symbol BTCUSDT \
+  --cacheInterval "1m, 15m, 1h, 4h"
+
+# Second run: reads from cache, no API calls needed
+npx @backtest-kit/cli --backtest ./strategy.ts --symbol BTCUSDT --noCache
+```
+
+<Note>
+  The cache is stored under `./dump/data/candle/` relative to your strategy file's directory. In a monorepo each strategy gets its own isolated `dump/` folder, so caches never collide between strategies.
+</Note>
+
+You can also warm the cache programmatically using `warmCandles`:
+
+```typescript
+import { warmCandles } from "backtest-kit";
+
+await warmCandles({
+  exchangeName: "binance",
+  from: new Date("2026-04-01T00:00:00Z"),
+  to: new Date("2026-04-27T00:00:00Z"),
+  interval: "1m",
+  symbol: "BTCUSDT",
+});
+```
+
+---
+
+## Report Outputs
+
+After every backtest the framework writes reports to `./dump/` relative to your strategy directory. The CLI flushes old reports at the start of each run (unless you pass `--noFlush`).
+
+### Markdown Reports
+
+Human-readable tables generated automatically for every backtest:
+
+```bash
+cat ./dump/markdown/apr_2026_strategy.md
+```
+
+Example output:
+
+```markdown
+# Backtest Report: apr_2026_strategy
+
+| Signal ID | Symbol  | Position | Open Price | Close Price | PNL (net) | Close Reason |
+|-----------|---------|----------|------------|-------------|-----------|--------------|
+| signal-1  | BTCUSDT | LONG     | 83200.00   | 85750.00    | +3.06%    | target_pnl   |
+| signal-2  | BTCUSDT | LONG     | 79400.00   | 81850.00    | +3.09%    | target_pnl   |
+
+**Total signals:** 22
+**Win rate:** 81.82% (18W / 4L)
+**Total PnL:** +67.85%
+**Sharpe Ratio:** 0.12
+**Max Drawdown:** -2.59%
+```
+
+### JSONL Logs
+
+Machine-readable logs written incrementally to `./dump/report/`. One JSON object per line, append-only:
+
+```bash
+cat ./dump/report/log.jsonl | grep '"action":"closed"'
+```
+
+JSONL logs include the full signal lifecycle, partial close events, risk rejections, and DCA entries — everything you need for post-trade analysis or feeding into a custom analytics pipeline.
+
+---
+
+## Performance Metrics
+
+The framework calculates a comprehensive set of metrics across all closed signals after each run. Starting from v10.2.0, multi-symbol reports use a statistically rigorous **Pooled Sharpe Ratio** — all per-trade returns across every symbol are pooled into a single sample before computing the ratio, preventing the mathematical distortions of averaging individual Sharpe values.
+
+| Metric | Description |
+| --- | --- |
+| **Total PnL** | Cumulative profit/loss as a percentage of deployed capital |
+| **Win Rate** | Percentage of closed positions that were profitable |
+| **Average Win / Loss** | Mean gain on winners, mean loss on losers |
+| **Sharpe Ratio** | Risk-adjusted return (uses Bessel's correction, gated at ≥ 10 signals) |
+| **Sortino Ratio** | Downside-risk-adjusted return (canonical Sortino 1991 formula) |
+| **Max Drawdown** | Largest peak-to-trough decline on the compounded equity curve |
+| **Recovery Factor** | Total profit divided by max drawdown |
+| **Expectancy** | Average profit per trade across wins and losses |
+
+<Note>
+  The engine returns `N/A` instead of a number for Sharpe and Sortino when fewer than 10 signals are present or when the trade history spans fewer than 14 calendar days. This prevents misleading statistics on tiny samples.
+</Note>
+
+---
+
+## Walker: A/B Strategy Comparison
+
+Walker mode runs multiple strategy variants against the same historical data and prints a ranked comparison report. Use it to systematically evaluate parameter changes, different signal logic, or alternative exit rules before committing to a single approach.
+
+```bash
+npx @backtest-kit/cli --walker \
+  --symbol BTCUSDT \
+  --noCache \
+  ./content/v1.strategy.ts \
+  ./content/v2.strategy.ts \
+  ./content/v3.strategy.ts
+```
+
+Save the comparison as a Markdown file:
+
+```bash
+npx @backtest-kit/cli --walker \
+  --symbol BTCUSDT \
+  --noCache \
+  --markdown \
+  --output apr_2026_comparison \
+  ./content/v1.strategy.ts \
+  ./content/v2.strategy.ts \
+  ./content/v3.strategy.ts
+# → ./dump/apr_2026_comparison.md
+```
+
+Save as JSON for programmatic analysis:
+
+```bash
+npx @backtest-kit/cli --walker \
+  --symbol BTCUSDT \
+  --noCache \
+  --json \
+  --output apr_2026_comparison \
+  ./content/v1.strategy.ts \
+  ./content/v2.strategy.ts
+# → ./dump/apr_2026_comparison.json
+```
+
+**Walker-specific flags:**
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--walker` | boolean | `false` | Enable Walker comparison mode |
+| `--output` | string | auto-generated | Output file base name |
+| `--json` | boolean | `false` | Save Walker results as JSON |
+| `--markdown` | boolean | `false` | Save Walker report as a `.md` file |
+| `--noFlush` | boolean | `false` | Keep existing output folders before the run |
+
+---
+
+## Programmatic API
+
+You can drive backtests and Walker comparisons from code instead of the CLI. This is useful for integrating Backtest Kit into custom tooling, test suites, or automated pipelines.
+
+### `Backtest.background()`
+
+`Backtest.background()` starts a backtest in the background and returns immediately, allowing you to launch multiple backtests in the same Node.js process.
+
+```typescript
+import {
+  addExchangeSchema,
+  addFrameSchema,
+  addStrategySchema,
+  Backtest,
+} from "backtest-kit";
+import ccxt from "ccxt";
+
+addExchangeSchema({
+  exchangeName: "binance",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit
+    );
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+addFrameSchema({
+  frameName: "apr-2026",
+  interval: "1m",
+  startDate: new Date("2026-04-01T00:00:00Z"),
+  endDate: new Date("2026-04-27T00:00:00Z"),
+});
+
+addStrategySchema({
+  strategyName: "my-strategy",
+  interval: "15m",
+  getSignal: async (symbol) => null,
+});
+
+// Start a backtest — returns immediately, runs in the background
+Backtest.background("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+  frameName: "apr-2026",
+});
+```
+
+### `Backtest.run()`
+
+`Backtest.run()` starts a backtest and returns a `Promise` that resolves when the backtest completes. Use it when you need to `await` the result before continuing:
+
+```typescript
+import { Backtest } from "backtest-kit";
+
+await Backtest.run("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+  frameName: "apr-2026",
+});
+
+console.log("Backtest finished — generating report...");
+```
+
+### `Walker.background()`
+
+`Walker.background()` runs multiple strategy files against the same historical period and collects ranked results without blocking:
+
+```typescript
+import { Walker } from "backtest-kit";
+
+Walker.background(["BTCUSDT"], {
+  strategyFiles: [
+    "./content/v1.strategy.ts",
+    "./content/v2.strategy.ts",
+  ],
+  exchangeName: "binance",
+  frameName: "apr-2026",
+});
+```
+
+### Completion Detection with `listenDone` / `listenDoneOnce`
+
+Use `listenDone` to register a callback that fires every time any backtest completes. Use `listenDoneOnce` to fire exactly once and then auto-unsubscribe — useful when you're waiting for a single backtest in a script.
+
+```typescript
+import { Backtest, listenDone, listenDoneOnce } from "backtest-kit";
+
+// Fires every time any backtest completes
+listenDone(({ symbol }) => {
+  console.log(`Backtest completed: ${symbol}`);
+});
+
+// Fires exactly once, then removes itself
+listenDoneOnce(({ symbol }) => {
+  console.log(`First backtest done: ${symbol}`);
+});
+
+Backtest.background("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+  frameName: "apr-2026",
+});
+```
+
+### Monitoring with `listenSignal`
+
+`listenSignal` fires on every signal lifecycle event — opened, closed, scheduled, cancelled — giving you a hook to react programmatically to position changes during a backtest:
+
+```typescript
+import { listenSignal } from "backtest-kit";
+
+listenSignal(({ action, symbol, signal }) => {
+  if (action === "opened") {
+    console.log(`[${symbol}] Position opened @ ${signal.priceOpen}`);
+  }
+  if (action === "closed") {
+    console.log(`[${symbol}] Position closed — PnL: ${signal.pnlPercent?.toFixed(2)}%`);
+  }
+});
+```
+
+---
+
+## How to Read Backtest Results
+
+<Tip>
+  The Backtest Kit web dashboard (`--ui`) shows a live signal state graph while the backtest runs. You can pause the timeline, click on any signal node to inspect entry/exit prices, and see DCA ladder entries visualized in real time — much faster than grepping log files.
+</Tip>

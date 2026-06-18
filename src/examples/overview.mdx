@@ -1,0 +1,82 @@
+---
+title: "Backtest Kit Strategy Examples: Real Production Results"
+sidebarTitle: "Overview"
+description: "Production Backtest Kit strategy examples with real backtest results: DCA ladders, AI news sentiment, Pine Script breakout, signal inversion, and more."
+---
+
+Every example in this section is a real strategy that was backtested against historical market data with documented PnL, Sharpe ratio, win rate, and trade-by-trade logs. These are not moving-average crossovers on clean daily candles — they are production-ready patterns covering DCA ladders, AI-driven news sentiment, TradingView Pine Script integration, signal inversion, and prediction-market-based entries. You can clone the repository, run each backtest with a single command, and reproduce the exact results shown here.
+
+## Strategy Examples
+
+<CardGroup cols={2}>
+  <Card title="DCA Ladder" icon="stairs" href="/examples/dca-ladder">
+    Dollar-cost average into LONG and SHORT positions with overlap detection and target-based exits. The SHORT variant returned **\+37.83%** in March 2026; the LONG variant returned **\+67.85%** in April 2026.
+  </Card>
+
+  <Card title="AI News Sentiment" icon="newspaper" href="/examples/ai-news-sentiment">
+    Fetch live crypto headlines via Tavily, classify them with a local Ollama model, and trade the sentiment. Returned **\+16.99%** in February 2026 — a month BTC fell 16.4%.
+  </Card>
+
+  <Card title="Pine Script Breakout" icon="chart-line" href="/examples/pinescript-breakout">
+    Run a TradingView Bollinger Band range-breakout indicator directly in Node.js via `@backtest-kit/pinets`, no rewrite required. Returned **\+2.40%** with a **66.7% win rate** in December 2025.
+  </Card>
+
+  <Card title="Signal Inversion" icon="arrows-left-right" href="https://github.com/tripolskypetr/backtest-kit/tree/master/example/content/jan_2026.strategy">
+    Load real Telegram channel signals, invert the direction, and harvest the liquidity retail followers create. Returned **\+8.58%** with a **Sharpe of 1.14** — the highest in the set.
+  </Card>
+</CardGroup>
+
+## All Strategies at a Glance
+
+The table below summarises every documented example. PnL figures represent returns on deployed capital for the backtest window. Sharpe ratios are computed per-trade (mean / std of individual trade returns) unless noted.
+
+| Strategy | Signal Source | Key Technique | PnL | Sharpe |
+| --- | --- | --- | --- | --- |
+| Neural Network (Oct 2021) | TensorFlow feed-forward NN | Trailing take-profit, real-time model training | \+18.26% | 0.31 |
+| Pine Script Range Breakout (Dec 2025) | TradingView Pine Script via `@backtest-kit/pinets` | Bollinger Band range breakout, volume spike | \+2.40% | 0.06 |
+| Signal Inversion (Jan 2026) | Real Telegram channel signals, inverted | Counter-trend entry, liquidity harvesting | \+8.58% | **1.14** |
+| AI News Sentiment (Feb 2026) | Tavily search \+ local Ollama model | News-driven position flipping, trailing TP | \+16.99% | 0.25 |
+| SHORT DCA Ladder (Mar 2026) | Fixed SHORT signal with DCA | Mean-reversion SHORT ladder, 0.5% target | \+37.83% | 0.35 |
+| LONG DCA Ladder (Apr 2026) | Fixed LONG signal with DCA | Mean-reversion LONG ladder, 3% target | \+67.85% | 0.12 |
+| Python EMA Crossover (Feb 2021) | Python WASM (EMA 9/21) | Multi-timeframe EMA crossover, bracket orders | \+5.52% / 63.6% WR | 0.09 |
+| Polymarket Δprob (Apr 2024) | Prediction market probability shifts | Delta-probability signal, trailing exit | 70% WR | 0.065 |
+
+## Reproducing the Results
+
+Every strategy ships as a runnable TypeScript file inside the `example/` directory of the Backtest Kit repository. To reproduce any result:
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/tripolskypetr/backtest-kit.git
+    cd backtest-kit/example
+    npm install
+    ```
+  </Step>
+  <Step title="Run the backtest">
+    Each example includes its exact CLI command. For example, to reproduce the SHORT DCA ladder:
+
+    ```bash
+    npm start -- --backtest --symbol BTCUSDT \
+      --strategy mar_2026_strategy \
+      --exchange ccxt-exchange \
+      --frame mar_2026_frame \
+      ./content/mar_2026.strategy/mar_2026.strategy.ts
+    ```
+  </Step>
+  <Step title="Inspect the report">
+    The framework automatically generates a Markdown performance report in `./dump/backtest/`. Open it to see trade-by-trade PnL, Sharpe ratio, drawdown, and win rate — identical to the numbers shown in this documentation.
+  </Step>
+  <Step title="Open the web UI (optional)">
+    Add `--ui` to any command to launch the interactive dashboard at `http://localhost:60050`, where you can inspect each signal's state transitions in real time.
+
+    ```bash
+    npm start -- --backtest --symbol BTCUSDT --ui \
+      ./content/mar_2026.strategy/mar_2026.strategy.ts
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Historical candle data is fetched automatically from Binance via CCXT and cached locally on first run. Subsequent runs of the same symbol and date range use the cache, making iteration fast.
+</Note>

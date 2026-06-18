@@ -1,0 +1,376 @@
+---
+title: "@backtest-kit/ollama: LLM Providers for Trading Bots"
+sidebarTitle: "Ollama"
+description: "Use 10+ LLM providers in Backtest Kit with @backtest-kit/ollama. One HOF wraps your signal function, enforces JSON schema output, and rotates API keys."
+---
+
+`@backtest-kit/ollama` is a universal LLM inference adapter for Backtest Kit strategies. It gives you a single, consistent API across more than ten model providers — from OpenAI and Anthropic to local Ollama instances — and handles the plumbing that would otherwise eat your development time: structured JSON output enforcement, API key rotation, trading-specific context injection, and userspace prompt modules. You wrap your signal function with a provider HOF, define a Zod schema, and the library takes care of the rest.
+
+## Installation
+
+```bash
+npm install @backtest-kit/ollama backtest-kit agent-swarm-kit
+```
+
+<Note>
+  `agent-swarm-kit` provides the `addOutline` and `json` primitives that `@backtest-kit/ollama` builds on. Both packages must be installed.
+</Note>
+
+## Supported Providers
+
+| Provider | HOF function | Base URL |
+| --- | --- | --- |
+| OpenAI (GPT-5, GPT-4o) | `gpt5()` | `https://api.openai.com/v1/` |
+| Anthropic Claude | `claude()` | `https://api.anthropic.com/v1/` |
+| DeepSeek | `deepseek()` | `https://api.deepseek.com/` |
+| Grok | `grok()` | `https://api.x.ai/v1/` |
+| Mistral | `mistral()` | `https://api.mistral.ai/v1/` |
+| Perplexity | `perplexity()` | `https://api.perplexity.ai/` |
+| Cohere | `cohere()` | `https://api.cohere.ai/compatibility/v1/` |
+| Alibaba (Qwen) | `alibaba()` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/` |
+| Hugging Face | `hf()` | `https://router.huggingface.co/v1/` |
+| Ollama (local) | `ollama()` | `http://localhost:11434/` |
+| Zhipu AI (GLM-4) | `glm4()` | `https://open.bigmodel.cn/api/paas/v4/` |
+
+## HOF (Higher-Order Function) API
+
+Every provider exposes the same HOF signature. You pass your async signal function, a model name, and an API key (or an array of keys for rotation), and you get back a function with the same signature that runs inside the provider's inference context.
+
+```typescript
+// Signature — identical for all providers
+provider(fn, model, apiKey?) => fn
+
+// Examples
+const getSignal = deepseek(rawGetSignal, 'deepseek-chat', process.env.DEEPSEEK_API_KEY);
+const getSignal = claude(rawGetSignal,   'claude-opus-4', process.env.ANTHROPIC_API_KEY);
+const getSignal = gpt5(rawGetSignal,     'gpt-4o',        process.env.OPENAI_API_KEY);
+const getSignal = ollama(rawGetSignal,   'llama3.3:70b'); // no key needed for local
+```
+
+<Tip>
+  Because all HOFs share the same signature, you can swap providers by changing a single line — useful for A/B testing model performance on the same strategy.
+</Tip>
+
+## Defining a Signal Schema with Zod
+
+Define your expected LLM output as a Zod schema. The library enforces this schema at inference time, retrying if the model returns malformed JSON, so your strategy code never needs to validate or parse.
+
+```typescript
+// schema/Signal.schema.ts
+import { z } from 'zod';
+import { str } from 'functools-kit';
+
+export const SignalSchema = z.object({
+  position: z.enum(['long', 'short', 'wait']).describe(
+    str.newline(
+      'Position direction:',
+      'long: bullish signals, uptrend potential',
+      'short: bearish signals, downtrend potential',
+      'wait: conflicting signals or unfavorable conditions',
+    )
+  ),
+  price_open: z.number().describe(
+    str.newline(
+      'Entry price in USD',
+      'Current market price or limit order price',
+    )
+  ),
+  price_stop_loss: z.number().describe(
+    str.newline(
+      'Stop-loss price in USD',
+      'LONG: below price_open',
+      'SHORT: above price_open',
+    )
+  ),
+  price_take_profit: z.number().describe(
+    str.newline(
+      'Take-profit price in USD',
+      'LONG: above price_open',
+      'SHORT: below price_open',
+    )
+  ),
+  minute_estimated_time: z.number().describe(
+    'Estimated time to reach TP in minutes'
+  ),
+  risk_note: z.string().describe(
+    str.newline(
+      'Risk assessment:',
+      '- Whale manipulations',
+      '- Order book imbalance',
+      '- Technical divergences',
+      'Provide specific numbers and percentages',
+    )
+  ),
+});
+
+export type TSignalSchema = z.infer<typeof SignalSchema>;
+```
+
+## Registering a Schema with `addOutline()`
+
+Register your schema once at startup using `addOutline` from `agent-swarm-kit`. This connects the schema to a named outline that your strategy calls by name. You can add validation rules that throw if the model returns out-of-range values.
+
+<CodeGroup>
+
+```typescript With Zod
+// outline/signal.outline.ts
+import { addOutline } from 'agent-swarm-kit';
+import { zodResponseFormat } from 'openai/helpers/zod';
+import { SignalSchema, TSignalSchema } from '../schema/Signal.schema';
+import { CompletionName } from '@backtest-kit/ollama';
+
+addOutline<TSignalSchema>({
+  outlineName: 'SignalOutline',
+  completion: CompletionName.RunnerOutlineCompletion,
+  format: zodResponseFormat(SignalSchema, 'position_decision'),
+
+  getOutlineHistory: async ({ history, param: messages = [] }) => {
+    await history.push(messages);
+  },
+
+  validations: [
+    {
+      validate: ({ data }) => {
+        if (data.position === 'long' && data.price_stop_loss >= data.price_open) {
+          throw new Error('For LONG, stop_loss must be below price_open');
+        }
+        if (data.position === 'short' && data.price_stop_loss <= data.price_open) {
+          throw new Error('For SHORT, stop_loss must be above price_open');
+        }
+      },
+    },
+  ],
+});
+```
+
+```typescript Without Zod (plain JSON schema)
+// outline/signal.outline.ts
+import { addOutline, IOutlineFormat } from 'agent-swarm-kit';
+import { CompletionName } from '@backtest-kit/ollama';
+
+const format: IOutlineFormat = {
+  type: 'object',
+  properties: {
+    take_profit_price: { type: 'number', description: 'Take profit price in USD' },
+    stop_loss_price:   { type: 'number', description: 'Stop-loss price in USD' },
+    description:       { type: 'string', description: 'User-friendly risk explanation, min 10 sentences' },
+    reasoning:         { type: 'string', description: 'Technical analysis reasoning, min 15 sentences' },
+  },
+  required: ['take_profit_price', 'stop_loss_price', 'description', 'reasoning'],
+};
+
+addOutline({
+  outlineName: 'SignalOutline',
+  format,
+  prompt: 'Generate crypto trading signals based on price and volume indicators in JSON format.',
+  completion: CompletionName.RunnerOutlineCompletion,
+  getOutlineHistory: async ({ history, param: messages }) => {
+    await history.push(messages);
+  },
+});
+```
+
+</CodeGroup>
+
+## Token Rotation
+
+Pass an array of API keys instead of a single string. The HOF rotates through them round-robin, which lets you stay within per-key rate limits without any additional code.
+
+```typescript
+import { deepseek } from '@backtest-kit/ollama';
+
+const getSignal = deepseek(
+  rawGetSignal,
+  'deepseek-chat',
+  [
+    process.env.DEEPSEEK_KEY_1,
+    process.env.DEEPSEEK_KEY_2,
+    process.env.DEEPSEEK_KEY_3,
+  ]
+);
+```
+
+## Userspace Prompts
+
+Place prompt modules in `config/prompt/` as `.cjs` files. Each module exports a `system` value and a `user` function. The library injects the active symbol, strategy name, exchange name, timeframe, and backtest mode flag automatically — your prompt functions receive them as arguments.
+
+```javascript
+// config/prompt/signal.prompt.cjs
+module.exports = {
+  // system can be a static array or a function with the same signature as user
+  system: (symbol, strategyName, exchangeName, frameName, backtest) => [
+    `You are analyzing ${symbol} on ${exchangeName}.`,
+    `Strategy: ${strategyName} | Timeframe: ${frameName}`,
+    backtest ? 'Running in backtest mode — be precise.' : 'Running live — be conservative.',
+  ],
+
+  user: (symbol) => `Analyze ${symbol} and return a trading decision in the required JSON format.`,
+};
+```
+
+Load and commit the prompt to your message array using `Module.fromPath` and `commitPrompt`:
+
+```typescript
+import { Module, commitPrompt, MessageModel } from '@backtest-kit/ollama';
+
+const signalModule = Module.fromPath('signal.prompt.cjs');
+// Default base directory is {cwd}/config/prompt/
+
+const messages: MessageModel[] = [];
+await commitPrompt(signalModule, messages);
+// messages now contains the resolved system and user messages
+```
+
+<Note>
+  Prompt modules are memoized after the first load. The `.cjs` file is read from disk once per process lifetime, making repeated calls to `commitPrompt` cheap.
+</Note>
+
+### Inline prompts
+
+If you prefer to keep the prompt in TypeScript rather than a separate file, use `Prompt.fromPrompt`:
+
+```typescript
+import { Prompt, commitPrompt, MessageModel } from '@backtest-kit/ollama';
+
+const prompt = Prompt.fromPrompt({
+  system: ['You are a disciplined trading bot. Never override the stop-loss.'],
+  user: (symbol) => `What is the current trend for ${symbol}? Return JSON.`,
+});
+
+const messages: MessageModel[] = [];
+await commitPrompt(prompt, messages);
+```
+
+## Trading-Specific Context Injection
+
+The `PromptModel` `system` and `user` functions receive five context values from the active Backtest Kit environment:
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `symbol` | `string` | Trading pair, e.g. `"BTCUSDT"` |
+| `strategyName` | `string` | Name passed to `addStrategy` |
+| `exchangeName` | `string` | Exchange identifier |
+| `frameName` | `string` | Active timeframe, e.g. `"5m"` |
+| `backtest` | `boolean` | `true` during backtesting, `false` in live mode |
+
+## Complete Example
+
+The example below wires together a Zod schema, an outline registration, a prompt module, and a DeepSeek-powered strategy.
+
+<CodeGroup>
+
+```typescript schema/Signal.schema.ts
+import { z } from 'zod';
+import { str } from 'functools-kit';
+
+export const SignalSchema = z.object({
+  position: z.enum(['long', 'short', 'wait']).describe(
+    str.newline(
+      'Position direction:',
+      'long: bullish signals, uptrend potential',
+      'short: bearish signals, downtrend potential',
+      'wait: conflicting signals or unfavorable conditions',
+    )
+  ),
+  price_open: z.number().describe('Entry price in USD'),
+  price_stop_loss: z.number().describe(
+    str.newline('Stop-loss price in USD', 'LONG: below price_open', 'SHORT: above price_open')
+  ),
+  price_take_profit: z.number().describe(
+    str.newline('Take-profit price in USD', 'LONG: above price_open', 'SHORT: below price_open')
+  ),
+  minute_estimated_time: z.number().describe('Estimated minutes to reach take-profit'),
+  risk_note: z.string().describe('Risk assessment with specific numbers and percentages'),
+});
+
+export type TSignalSchema = z.infer<typeof SignalSchema>;
+```
+
+```typescript outline/signal.outline.ts
+import { addOutline } from 'agent-swarm-kit';
+import { zodResponseFormat } from 'openai/helpers/zod';
+import { CompletionName } from '@backtest-kit/ollama';
+import { SignalSchema, TSignalSchema } from '../schema/Signal.schema';
+
+addOutline<TSignalSchema>({
+  outlineName: 'SignalOutline',
+  completion: CompletionName.RunnerOutlineCompletion,
+  format: zodResponseFormat(SignalSchema, 'position_decision'),
+
+  getOutlineHistory: async ({ history, param: messages = [] }) => {
+    await history.push(messages);
+  },
+
+  validations: [
+    {
+      validate: ({ data }) => {
+        if (data.position === 'long' && data.price_stop_loss >= data.price_open) {
+          throw new Error('For LONG, stop_loss must be below price_open');
+        }
+        if (data.position === 'short' && data.price_stop_loss <= data.price_open) {
+          throw new Error('For SHORT, stop_loss must be above price_open');
+        }
+      },
+    },
+  ],
+});
+```
+
+```javascript config/prompt/signal.prompt.cjs
+module.exports = {
+  system: (symbol, strategyName, exchangeName, frameName, backtest) => [
+    `You are a professional crypto trading analyst specializing in ${symbol}.`,
+    `Exchange: ${exchangeName} | Strategy: ${strategyName} | Timeframe: ${frameName}`,
+    backtest
+      ? 'You are in backtest mode. Maximize signal precision.'
+      : 'You are in live mode. Prioritize risk management.',
+  ],
+  user: (symbol) =>
+    `Analyze the technical context for ${symbol} and return a trading decision in the required JSON format.`,
+};
+```
+
+```typescript strategy.ts
+// Import outline registration first — side-effectful
+import './outline/signal.outline';
+
+import { deepseek, Module, commitPrompt, MessageModel } from '@backtest-kit/ollama';
+import { addStrategy } from 'backtest-kit';
+import { json } from 'agent-swarm-kit';
+import { commitHistorySetup } from '@backtest-kit/signals';
+
+const signalModule = Module.fromPath('signal.prompt.cjs');
+
+// Unwrapped signal logic
+async function rawGetSignal(symbol: string) {
+  const messages: MessageModel[] = [];
+
+  // 1. Inject prompt (system + user context)
+  await commitPrompt(signalModule, messages);
+
+  // 2. Inject multi-timeframe technical analysis
+  await commitHistorySetup(symbol, messages);
+
+  // 3. Call the outline — enforces schema + retries on invalid JSON
+  const { data } = await json('SignalOutline', messages);
+
+  return {
+    position:          data.position,
+    priceTakeProfit:   data.price_take_profit,
+    priceStopLoss:     data.price_stop_loss,
+    estimatedTime:     data.minute_estimated_time,
+  };
+}
+
+// Wrap with DeepSeek provider HOF — single-line provider swap
+const getSignal = deepseek(rawGetSignal, 'deepseek-chat', process.env.DEEPSEEK_API_KEY);
+
+addStrategy({
+  strategyName: 'llm-deepseek',
+  interval: '5m',
+  riskName: 'demo',
+  getSignal,
+});
+```
+
+</CodeGroup>

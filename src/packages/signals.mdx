@@ -1,0 +1,284 @@
+---
+title: "@backtest-kit/signals: 50+ Indicators for LLM Strategies"
+sidebarTitle: "Signals"
+description: "Turn raw market data into LLM-ready Markdown reports. @backtest-kit/signals computes 50+ indicators across 1m, 15m, 30m, and 1h timeframes with one await."
+---
+
+`@backtest-kit/signals` transforms raw market data into richly formatted Markdown reports that you can inject directly into an LLM's context window. Instead of manually computing indicators, formatting tables, and managing caching, you call a single function and receive a complete multi-timeframe technical picture — order book depth, candle history, and 50\+ computed indicators — ready for your trading strategy to consume.
+
+## Installation
+
+```bash
+npm install @backtest-kit/signals backtest-kit
+```
+
+## Quick Start
+
+The fastest path to LLM-ready market data is `commitHistorySetup`. One `await` appends the full technical picture — order book, candle histories, and all four timeframes of indicators — to your `messages` array.
+
+```typescript
+import { commitHistorySetup } from '@backtest-kit/signals';
+
+const messages = [
+  {
+    role: 'system',
+    content: 'You are a trading bot. Analyze technical indicators and generate signals.',
+  },
+];
+
+// Appends order book analysis + candle history + all 4 timeframes of indicators
+await commitHistorySetup('BTCUSDT', messages);
+
+// messages is now ready for your LLM call
+const signal = await llm(messages);
+```
+
+<Note>
+  `commitHistorySetup` reads the symbol from the active backtest context automatically. You can pass any spot or futures symbol that your exchange supports.
+</Note>
+
+## Timeframes
+
+`@backtest-kit/signals` covers four synchronized timeframes. Each is tuned for a distinct trading horizon, with indicator parameters chosen accordingly.
+
+| Constant | Timeframe | Candles fetched | Primary use case |
+| --- | --- | --- | --- |
+| **MicroTerm** | 1m | 60 | Scalping, ultra-short entries |
+| **ShortTerm** | 15m | 144 | Day trading |
+| **SwingTerm** | 30m | 96 | Swing trading |
+| **LongTerm** | 1h | 100 | Trend analysis |
+
+### Per-timeframe indicators
+
+<AccordionGroup>
+  <Accordion title="MicroTerm (1m) — RSI, MACD, Stochastic, ADX, Bollinger, ATR, CCI, Volume, Squeeze">
+    | Indicator | Parameters |
+    | --- | --- |
+    | RSI | periods 9, 14 |
+    | MACD | Fast 8 / Slow 21 / Signal 5 |
+    | Stochastic | K=3, D=3, Smooth=3 |
+    | ADX | period 9 |
+    | Bollinger Bands | period 8, std 2 |
+    | ATR | periods 5, 9 |
+    | CCI | period 9 |
+    | Volume trend | SMA(5), ±20% threshold |
+    | Momentum / ROC | — |
+    | Support / Resistance | ±0.3% lookback threshold |
+    | Squeeze | — |
+  </Accordion>
+
+  <Accordion title="ShortTerm (15m) — RSI, MACD, Stochastic, ADX, Bollinger, Fibonacci">
+    | Indicator | Parameters |
+    | --- | --- |
+    | RSI | period 9 |
+    | MACD | Fast 8 / Slow 21 / Signal 5 |
+    | Stochastic | K=5, D=3, Smooth=3 |
+    | ADX | period 14 |
+    | Bollinger Bands | period 10, std 2 |
+    | Fibonacci retracement | 0–100% \+ extensions |
+  </Accordion>
+
+  <Accordion title="SwingTerm (30m) — RSI, MACD, Stochastic, Bollinger, Support/Resistance">
+    | Indicator | Parameters |
+    | --- | --- |
+    | RSI | period 14 |
+    | MACD | Fast 12 / Slow 26 / Signal 9 |
+    | Stochastic | K=14, D=3, Smooth=3 |
+    | Bollinger Bands | period 20, std 2 |
+    | Support / Resistance | ±0.3% pivot detection |
+  </Accordion>
+
+  <Accordion title="LongTerm (1h) — RSI, MACD, ADX, Bollinger, SMA, DEMA, WMA, Volume Trend">
+    | Indicator | Parameters |
+    | --- | --- |
+    | RSI | period 14 |
+    | MACD | Fast 12 / Slow 26 / Signal 9 |
+    | ADX | period 14 |
+    | Bollinger Bands | period 20, std 2 |
+    | SMA | period 50 |
+    | DEMA | — |
+    | WMA | — |
+    | Volume trend | 6-candle average, ±10% threshold |
+    | Support / Resistance | 4-candle pivot method |
+  </Accordion>
+</AccordionGroup>
+
+## Granular Functions
+
+When you need fine-grained control over exactly which data enters the LLM context, you can call each report function individually rather than using `commitHistorySetup`.
+
+```typescript
+import {
+  commitBookDataReport,
+  commitOneMinuteHistory,
+  commitFifteenMinuteHistory,
+  commitThirtyMinuteHistory,
+  commitHourHistory,
+  commitMicroTermMath,
+  commitShortTermMath,
+  commitSwingTermMath,
+  commitLongTermMath,
+} from '@backtest-kit/signals';
+
+const messages = [];
+
+// Order book analysis (bid/ask depth, spread, imbalance)
+await commitBookDataReport('BTCUSDT', messages);
+
+// Candle histories (recent bars formatted as Markdown tables)
+await commitOneMinuteHistory('BTCUSDT', messages);      // Last 15 candles
+await commitFifteenMinuteHistory('BTCUSDT', messages);  // Last 8 candles
+await commitThirtyMinuteHistory('BTCUSDT', messages);   // Last 6 candles
+await commitHourHistory('BTCUSDT', messages);           // Last 6 candles
+
+// Technical indicators per timeframe
+await commitMicroTermMath('BTCUSDT', messages);   // 1m indicators
+await commitShortTermMath('BTCUSDT', messages);   // 15m indicators
+await commitSwingTermMath('BTCUSDT', messages);   // 30m indicators
+await commitLongTermMath('BTCUSDT', messages);    // 1h indicators
+```
+
+Each function appends one Markdown section to `messages`. You can mix and match — for example, include only the 1m and 1h timeframes if your strategy doesn't need the intermediate horizons.
+
+## Order Book Analysis
+
+`commitBookDataReport` fetches the top 20 bid and ask levels and appends a section like this to your message array:
+
+```markdown
+## Order Book Analysis
+
+**Symbol:** BTCUSDT
+**Best Bid:** 50000.00 | **Best Ask:** 50001.00
+**Mid Price:** 50000.50 | **Spread:** 1.00
+**Depth Imbalance:** +5.2% (buy pressure)
+
+### Top 20 Levels (Bids)
+| Price    | Volume | % Total |
+|----------|--------|---------|
+| 50000.00 | 1.234  | 15.5%   |
+...
+
+### Top 20 Levels (Asks)
+| Price    | Volume | % Total |
+|----------|--------|---------|
+| 50001.00 | 0.987  | 12.3%   |
+...
+```
+
+The **depth imbalance** figure tells your LLM how much buy or sell pressure is sitting in the book right now — a useful signal on its own and a powerful complement to indicator data.
+
+## Caching Strategy
+
+All report functions cache their results to avoid redundant exchange API calls and re-computation within the same strategy tick.
+
+| Data | Cache duration |
+| --- | --- |
+| 1-minute candles & indicators | 1 minute |
+| 15-minute candles & indicators | 5 minutes |
+| 30-minute candles & indicators | 15 minutes |
+| 1-hour candles & indicators | 30 minutes |
+| Order book | 5 minutes |
+
+<Note>
+  The cache is cleared automatically on any error, so a failed fetch doesn't poison subsequent calls.
+</Note>
+
+## Key Algorithms
+
+### Support / Resistance Detection
+
+- **MicroTerm and SwingTerm**: scans back N candles and identifies significant highs and lows using a ±0.3% price threshold.
+- **LongTerm**: uses a 4-candle pivot point method — a bar qualifies as a pivot high/low only when both neighbouring bars confirm it.
+
+### Fibonacci Retracement
+
+The library computes the full set of retracement and extension levels from the detected swing high and swing low:
+
+- **Retracements**: 0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%
+- **Extensions**: 127.2%, 161.8%, 261.8%
+
+The nearest level to the current price (within a 1.5% tolerance) is reported as the active Fibonacci zone.
+
+### Volume Analysis
+
+- **MicroTerm**: compares current volume against a 5-bar SMA. Moves beyond ±20% are flagged as `increasing` or `decreasing`; otherwise `stable`.
+- **LongTerm**: compares current volume against the average of the preceding 6 candles using a ±10% threshold.
+
+### Order Book Imbalance Formula
+
+```text
+Imbalance = (bid_volume − ask_volume) / (bid_volume + ask_volume)
+```
+
+A positive value indicates buy pressure; a negative value indicates sell pressure. The result is expressed as a percentage and labelled accordingly in the report.
+
+## Custom Logger
+
+By default `@backtest-kit/signals` uses a no-op logger. To enable logging during development or to route output to your own log sink, call `setLogger` once at startup:
+
+```typescript
+import { setLogger } from '@backtest-kit/signals';
+
+setLogger({
+  log: console.log,
+  debug: console.debug,
+  info: console.info,
+  warn: console.warn,
+});
+```
+
+## Complete LLM Strategy Example
+
+The example below shows a production-style strategy that uses `commitHistorySetup` to build the context, adds a structured instruction message, calls an LLM, and saves the full conversation with `dumpSignal` for post-run debugging.
+
+```typescript
+import { v4 as uuid } from 'uuid';
+import { addStrategy, dumpSignal } from 'backtest-kit';
+import { commitHistorySetup } from '@backtest-kit/signals';
+import { json } from './utils/json.mjs'; // your LLM wrapper
+
+addStrategy({
+  strategyName: 'llm-signals-strategy',
+  interval: '5m',
+  riskName: 'demo',
+
+  getSignal: async (symbol) => {
+    const messages = [
+      {
+        role: 'system',
+        content: [
+          'You are a professional trading analyst.',
+          'Analyze the technical data provided and produce a precise signal.',
+          'Prefer "wait" when indicators conflict across timeframes.',
+        ].join('\n'),
+      },
+    ];
+
+    // Inject the full multi-timeframe technical picture
+    await commitHistorySetup(symbol, messages);
+
+    // Add the structured output instruction
+    messages.push({
+      role: 'user',
+      content: [
+        'Based on the technical analysis above, generate a trading signal.',
+        'Use position: "wait" if signals are unclear or contradictory.',
+        'Return JSON: { position: "long"|"short"|"wait", priceTakeProfit: number, priceStopLoss: number }',
+      ].join('\n'),
+    });
+
+    // Call your LLM
+    const resultId = uuid();
+    const signal = await json(messages);
+
+    // Persist the full conversation for offline analysis
+    await dumpSignal(resultId, messages, signal);
+
+    return { ...signal, id: resultId };
+  },
+});
+```
+
+<Tip>
+  Save the `messages` array with `dumpSignal` after every call. You can replay individual ticks later to understand why the LLM chose a particular position — invaluable during strategy refinement.
+</Tip>

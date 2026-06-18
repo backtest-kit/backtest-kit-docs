@@ -1,0 +1,366 @@
+---
+title: "Running Strategies Across Multiple Symbols in Parallel"
+sidebarTitle: "Multi-Symbol"
+description: "Run one strategy across dozens of trading pairs simultaneously using Backtest.background() and Live.background() in a single Node.js process."
+---
+
+Running a strategy across many symbols in separate processes is wasteful: each process needs its own storage connections and its own copy of the candle cache. Backtest Kit solves this differently. `Backtest.background()` and `Live.background()` each start an independent execution context inside the same Node.js process. All parallel contexts share the same infrastructure — the same event loop, the same storage adapters, the same candle cache — while maintaining strictly isolated state per symbol.
+
+This architecture achieves approximately **6,300× real-time aggregate speed** across 9 symbols on commodity hardware, making it practical to test a strategy against the entire top-50 crypto market cap in a single command.
+
+---
+
+## How Parallel Execution Works
+
+When you call `Backtest.background()` for each symbol in a loop, the engine:
+
+1. **Registers each symbol in an in-memory activity registry** — the engine knows exactly how many backtests are in flight and manages their lifecycle.
+2. **Assigns each symbol an isolated execution context** via Node.js `AsyncLocalStorage` — every function call automatically knows which symbol it belongs to, what the current simulation timestamp is, and which strategy/exchange/frame schemas apply.
+3. **Cooperatively yields the event loop between symbols** — when fetching candles, the active backtest hands control to peer backtests. All parallel calls advance in a fair round-robin rather than one symbol monopolizing the CPU.
+4. **Shares infrastructure with zero IPC** — all symbols read from the same candle cache and write to the same storage instance, so a cache hit on BTCUSDT benefits ETHUSDT immediately with no cross-process synchronization overhead.
+
+The result is that state is **independent per symbol** (positions, DCA entries, signal lifecycle) while infrastructure is **shared** (storage, connections, risk profiles).
+
+---
+
+## Performance on Commodity Hardware
+
+The following metrics were measured on an i5-13420H laptop running 9 symbols in parallel across a 27-day period at 1-minute resolution:
+
+| Metric | Value |
+| --- | --- |
+| Wall-clock time for 9 symbols | ~2.9 seconds |
+| Historical time advanced per symbol | 34 minutes |
+| Per-symbol replay speed | ~703× real-time |
+| **Aggregate replay speed (9 symbols)** | **~6,326× real-time** |
+| Event throughput | ~103 events/second |
+| Total candle ticks processed | ~350,000 (38,880 candles × 9 symbols) |
+
+Running the same strategy against 50 symbols over a full month takes minutes, not hours.
+
+---
+
+## Code Example: Backtest Across Multiple Symbols
+
+The following entry point backtests the same strategy on five symbols simultaneously. The CLI handles environment loading, candle cache warming, and graceful shutdown — your code only needs to register schemas and start each background context.
+
+```typescript
+// src/multi-symbol.ts
+import {
+  addExchangeSchema,
+  addFrameSchema,
+  addStrategySchema,
+  listenActivePing,
+  listenError,
+  commitClosePending,
+  commitAverageBuy,
+  getPositionEntries,
+  getPositionEntryOverlap,
+  getPositionPnlPercent,
+  Position,
+  Backtest,
+  Log,
+} from "backtest-kit";
+import ccxt from "ccxt";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+// ── Exchange ────────────────────────────────────────────────────────────────
+
+addExchangeSchema({
+  exchangeName: "binance",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit
+    );
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+// ── Frame ───────────────────────────────────────────────────────────────────
+
+addFrameSchema({
+  frameName: "apr-2026",
+  interval: "1m",
+  startDate: new Date("2026-04-01T00:00:00Z"),
+  endDate: new Date("2026-04-27T00:00:00Z"),
+});
+
+// ── Strategy ─────────────────────────────────────────────────────────────────
+
+const HARD_STOP = 25.0;
+const TARGET_PROFIT = 3;
+const LADDER_STEP_COST = 100;
+const LADDER_UPPER_STEP = 5;
+const LADDER_LOWER_STEP = 1;
+const LADDER_MAX_STEPS = 10;
+
+addStrategySchema({
+  strategyName: "dca-ladder",
+  getSignal: async (symbol, when, currentPrice) => ({
+    position: "long",
+    ...Position.moonbag({
+      position: "long",
+      currentPrice,
+      percentStopLoss: HARD_STOP,
+    }),
+    minuteEstimatedTime: Infinity,
+    cost: LADDER_STEP_COST,
+  }),
+});
+
+listenActivePing(async ({ symbol, currentPrice }) => {
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) return;
+
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) return;
+
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) return;
+
+  Log.info("position closed due to the target pnl reached", { symbol, data });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: str.newline("# Closed by target pnl"),
+  });
+});
+
+listenError((error) => {
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+
+// ── Launch parallel backtests ────────────────────────────────────────────────
+
+const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
+
+for (const symbol of symbols) {
+  Backtest.background(symbol, {
+    strategyName: "dca-ladder",
+    exchangeName: "binance",
+    frameName: "apr-2026",
+  });
+}
+```
+
+<Note>
+  `listenActivePing` and all other event listeners are **symbol-aware**. The `symbol` parameter in each handler callback refers to the specific symbol that triggered the event — you never need to guard against cross-symbol state leakage.
+</Note>
+
+---
+
+## Using the `--entry` CLI Flag
+
+By default, the CLI picks the symbol from `--symbol` and calls `Backtest.background()` for you. When you're managing multiple symbols yourself, pass `--entry` to tell the CLI that your file drives `Backtest.background()` calls directly:
+
+```bash
+npx @backtest-kit/cli --backtest --entry ./src/multi-symbol.ts
+```
+
+With `--entry`, the CLI still handles:
+
+- Loading `.env` files
+- Starting the `--ui` web dashboard if requested
+- Wiring up `--telegram` notifications
+- Loading the matching `./modules/backtest.module.mjs` broker adapter
+- SIGINT handling that stops every active run
+- Process exit once all runs complete
+
+What the CLI does **not** do in `--entry` mode: pick a symbol, warm the candle cache, or call `Backtest.background()` — those are your responsibility.
+
+```json
+{
+  "scripts": {
+    "backtest:multi": "npx @backtest-kit/cli --backtest --entry ./src/multi-symbol.ts"
+  }
+}
+```
+
+---
+
+## Monitoring: Waiting for All Completions
+
+`listenDone` fires every time any individual backtest finishes. To wait for the full set, track completions against your symbol list:
+
+```typescript
+import { Backtest, listenDone } from "backtest-kit";
+
+const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
+let completed = 0;
+
+listenDone(async ({ symbol }) => {
+  completed++;
+  console.log(`[${completed}/${symbols.length}] ${symbol} done`);
+
+  if (completed === symbols.length) {
+    console.log("All backtests complete");
+    // Trigger report generation, send summary notification, etc.
+  }
+});
+
+for (const symbol of symbols) {
+  Backtest.background(symbol, {
+    strategyName: "dca-ladder",
+    exchangeName: "binance",
+    frameName: "apr-2026",
+  });
+}
+```
+
+Use `listenDoneOnce` to fire exactly once — useful in scripts that should exit after a single run without manual process management:
+
+```typescript
+import { listenDoneOnce } from "backtest-kit";
+
+listenDoneOnce(({ symbol }) => {
+  console.log(`First symbol completed: ${symbol}`);
+});
+```
+
+---
+
+## Walker in Multi-Symbol Mode
+
+`Walker.background()` runs multiple strategy files against the same historical period and collects ranked results. You can combine it with the `--entry` pattern to evaluate variants across several symbols at once:
+
+```typescript
+import { Walker, listenDone } from "backtest-kit";
+
+Walker.background(["BTCUSDT", "ETHUSDT", "SOLUSDT"], {
+  strategyFiles: [
+    "./content/v1.strategy.ts",
+    "./content/v2.strategy.ts",
+  ],
+  exchangeName: "binance",
+  frameName: "apr-2026",
+});
+
+listenDone(({ symbol }) => {
+  console.log(`Walker finished for ${symbol}`);
+});
+```
+
+---
+
+## Cron Scheduler: Periodic Jobs Across Parallel Backtests
+
+The built-in cron scheduler lets you run periodic or fire-once jobs that are coordinated across all parallel backtest contexts. In backtest mode, virtual time alignment ensures jobs fire at the correct simulated timestamps rather than at wall-clock time.
+
+```typescript
+import { scheduleCron } from "backtest-kit";
+
+// Fire every simulated hour to warm secondary data
+scheduleCron({
+  name: "warm-funding-rates",
+  interval: "1h",
+  symbol: "BTCUSDT",
+  fn: async (symbol, timestamp) => {
+    console.log(`[cron] warming funding rates for ${symbol} at ${new Date(timestamp)}`);
+    // Fetch and cache funding rate data for this symbol
+  },
+});
+```
+
+**Cron capabilities:**
+
+| Feature | Description |
+| --- | --- |
+| **Periodic jobs** | Run every N minutes, hours, or days of virtual time |
+| **Fire-once jobs** | Execute a single time at a specific virtual timestamp |
+| **Symbol-specific** | Scope a job to one symbol or run globally across all symbols |
+| **Virtual time alignment** | In backtest mode, jobs fire at aligned simulation timestamps — not wall clock |
+| **Automatic retry** | Failed jobs are retried on the next interval without manual intervention |
+| **Mutex semantics** | Parallel backtests on the same symbol never run the same cron job concurrently |
+
+Common cron use cases in multi-symbol strategies:
+
+- Fetch funding rates hourly to adjust DCA aggressiveness
+- Parse external signal sources every 15 minutes
+- Daily portfolio rebalancing across all symbols
+- Warm secondary data caches at backtest startup
+
+---
+
+## Shared Infrastructure: MongoDB and Redis
+
+When running dozens of symbols in parallel, file-based storage becomes a bottleneck. Switch to MongoDB and Redis with a single setup call in `config/setup.config.ts`:
+
+```typescript
+// config/setup.config.ts
+import { setup } from "@backtest-kit/mongo";
+
+setup();
+```
+
+```env
+# .env
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-kit
+CC_REDIS_HOST=127.0.0.1
+CC_REDIS_PORT=6379
+```
+
+With MongoDB and Redis enabled:
+
+- **Candle lookups** use Redis O(1) key lookups instead of file scans — a cache hit costs nothing regardless of how many symbols are running.
+- **Signal state** is stored with atomic upserts and compound indexes, so parallel writes from different symbol contexts never collide.
+- **Backtest results** are queryable across symbols and time periods — you can aggregate PnL across the entire symbol set with a single query.
+
+<Tip>
+  The Redis cache uses a composite key of `exchangeName:symbol:interval:timestamp` to map directly to the storage document ID, bypassing file scans entirely. With 9\+ symbols running in parallel, this eliminates the most common backtest performance bottleneck.
+</Tip>
+
+---
+
+## Multi-Symbol Live Trading
+
+The same pattern applies to live trading. Call `Live.background()` in a loop and let the shared event loop manage all symbols:
+
+```typescript
+import { Live } from "backtest-kit";
+
+const symbols = [
+  "BTCUSDT", "ETHUSDT", "SOLUSDT",
+  "BNBUSDT", "XRPUSDT", "DOGEUSDT",
+];
+
+for (const symbol of symbols) {
+  Live.background(symbol, {
+    strategyName: "dca-ladder",
+    exchangeName: "binance",
+  });
+}
+```
+
+Run with the CLI:
+
+```bash
+npx @backtest-kit/cli --live --entry ./src/multi-symbol.ts --ui --telegram
+```
+
+All symbols share the same global risk profile (if configured), so a portfolio-wide position limit of, say, 5 concurrent trades is enforced across all 20 symbols simultaneously — not per-symbol. This prevents the common mistake of each symbol running its own risk checks independently, which can result in 20 × 10% = 200% portfolio exposure.
+
+<Warning>
+  When running live trading across many symbols, ensure your broker adapter accounts for per-symbol position sizing. The `cost` field in your signal controls capital deployment per trade, but your exchange enforces minimum order sizes and lot step requirements independently — validate these against your adapter's `formatQuantity` output before deploying.
+</Warning>

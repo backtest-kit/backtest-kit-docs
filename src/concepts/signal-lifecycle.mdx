@@ -1,0 +1,252 @@
+---
+title: "Signal Lifecycle: From Idle to Closed in Backtest Kit"
+sidebarTitle: "Signal Lifecycle"
+description: "Understand how Backtest Kit enforces a type-safe signal state machine (idle → opened → active → closed) using TypeScript discriminated unions."
+---
+
+Every trading position in Backtest Kit follows a strict, predictable path from the moment your strategy considers an entry to the moment the trade is fully exited and recorded. Rather than leaving signal state as a loosely typed object that can drift into ambiguous intermediate states, the framework encodes each stage as a TypeScript discriminated union — making invalid combinations unrepresentable at compile time and eliminating an entire class of state-corruption bugs before your code ever runs.
+
+## The Six Signal States
+
+A signal passes through six possible states during its lifetime. Each state is discrete, has well-defined properties, and limits which operations are legally callable on the signal at that moment.
+
+```text
+idle ──► scheduled ──► pending ──► opened ──► active ──► closed
+                    │                                      ▲
+                    └──────────── cancelled ───────────────┘
+```
+
+<Steps>
+  <Step title="Idle">
+    The strategy is running but has not produced a signal for the current symbol. No position exists and no entry order is queued. This state represents normal monitoring activity — the strategy tick fires, evaluates market conditions, and returns `null` from `getSignal`.
+
+    The engine emits an `IStrategyTickResultIdle` event every tick while the strategy is in this state so you can monitor activity, build heartbeat dashboards, or detect stalled strategies.
+  </Step>
+  <Step title="Scheduled">
+    Your `getSignal` function returned a signal that includes a specific `priceOpen` entry target. The framework records the desired entry price and waits for the market to reach it. Every minute while the signal waits, an `IStrategyTickResultScheduled` event fires, giving you the current price, theoretical PnL, and progress toward the TP/SL levels.
+
+    A scheduled signal can be explicitly activated early via `commitActivateScheduled`, or cancelled via `commitCancelScheduled`, without affecting the rest of the strategy.
+  </Step>
+  <Step title="Pending (Opened)">
+    The entry price condition has been met — either the market reached `priceOpen`, or `getSignal` returned a market-entry signal with no price target. The framework creates the position record atomically, persists it (in live mode), and emits `IStrategyTickResultOpened`.
+
+    At this point the signal has a unique `signalId`, recorded entry price, TP and SL levels, cost basis, and timestamps. DCA entries can begin accumulating from here.
+  </Step>
+  <Step title="Active">
+    Each tick, the framework evaluates whether the TP or SL has been breached using the VWAP of the last five 1-minute candles. While neither condition is met, the signal is "active" and the engine fires `IStrategyTickResultActive` with the current `percentTp`, `percentSl`, and unrealized `pnl` (inclusive of 0.1 % fee and 0.1 % slippage).
+
+    Active signals accept trailing stop/take adjustments (`commitTrailingStop`, `commitTrailingTake`), partial closes (`commitPartialProfit`, `commitPartialLoss`), DCA entries (`commitAverageBuy`), and breakeven protection (`commitBreakeven`).
+  </Step>
+  <Step title="Closed">
+    The position exits via one of four reasons: `take_profit`, `stop_loss`, `time_expired`, or a manual `commitClosePending` call. The framework writes a final PnL record, emits `IStrategyTickResultClosed` with the full performance breakdown, and releases the signal slot so the strategy can generate a new one.
+
+    Once closed, the signal's data becomes immutable. Attempting to call any mutation function (e.g. `commitAverageBuy`) on a closed signal results in a compile-time error because the TypeScript type no longer exposes those methods.
+  </Step>
+  <Step title="Cancelled (from Scheduled)">
+    A scheduled signal that never reaches the pending state can be cancelled. This keeps the cancellation record separate from closed positions so you can analyze signal quality and rejection patterns independently. The `IStrategyTickResultCancelled` event carries the `cancelReason` and an optional `cancelId` when the cancellation was user-initiated.
+  </Step>
+</Steps>
+
+## Why Invalid States Are Unrepresentable
+
+Traditional frameworks represent a signal as a single mutable object with optional fields — `closeTime` is `undefined` if open, `entryPrice` is `undefined` if not yet filled, and so on. Accessing `closeTime` on an open position silently returns `undefined`, potentially propagating `NaN` or incorrect logic deep into your strategy before crashing.
+
+Backtest Kit uses TypeScript **discriminated unions** to eliminate this pattern. Each state is a separate type:
+
+```typescript
+type TickResult =
+  | IStrategyTickResultIdle        // action: "idle"
+  | IStrategyTickResultScheduled   // action: "scheduled"
+  | IStrategyTickResultOpened      // action: "opened"
+  | IStrategyTickResultActive      // action: "active"
+  | IStrategyTickResultClosed      // action: "closed"
+  | IStrategyTickResultCancelled   // action: "cancelled"
+```
+
+The `action` discriminant narrows the type automatically. If you try to read `result.closeReason` when `result.action === "active"`, the TypeScript compiler rejects it because `IStrategyTickResultActive` simply does not have a `closeReason` property — there is no field to check, no runtime guard to forget.
+
+<Note>
+  This guarantee extends to all framework callbacks. `listenActivePing` only fires when a signal is in the active state, so its handler receives `IStrategyTickResultActive` and nothing else. You never need a defensive `if (signal.action === "active")` check inside these typed handlers.
+</Note>
+
+## Signal Validation at Creation
+
+Before a signal from `getSignal` ever reaches the execution engine, it passes through a rigorous validation pipeline. The framework checks:
+
+- **Positive prices** — `priceOpen`, `priceTakeProfit`, and `priceStopLoss` must all be greater than zero.
+- **TP/SL direction** — For a `long` position, `priceTakeProfit > priceOpen > priceStopLoss`. For a `short` position, the relationship is reversed.
+- **Risk/reward ratio** — The signal must meet the minimum R/R threshold configured in your risk schema.
+- **Valid timestamps** — The signal timestamp must not be in the future (prevents look-ahead bias in custom signal sources).
+- **Interval throttling** — A configurable cooldown (1 m, 3 m, 5 m, 15 m, 30 m, 1 h) prevents signal spam within the same window.
+
+When validation fails, the invalid signal is rejected and a detailed error is emitted via `listenError`. Your strategy continues operating normally — a rejected signal does not crash the backtest or halt live trading.
+
+<Warning>
+  Validation errors during live trading are surfaced immediately through `listenError` and the web dashboard. Always attach an error listener when running live to avoid silent signal suppression:
+
+  ```typescript
+  import { listenError } from "backtest-kit";
+  import { errorData, getErrorMessage } from "functools-kit";
+  
+  listenError((error) => {
+    console.error("Strategy error:", getErrorMessage(error), errorData(error));
+  });
+  ```
+</Warning>
+
+## Signal Cancellation
+
+A scheduled signal can be cancelled before it reaches the pending state in three ways:
+
+| Trigger | Description |
+| --- | --- |
+| **User intervention** | Call `commitCancelScheduled(symbol)` from any listener. |
+| **Timeout** | The signal's `minuteEstimatedTime` elapses while still waiting for `priceOpen`. |
+| **Conflicting signal** | A new signal is generated while the old scheduled signal is still waiting. |
+
+Cancelled signals appear in their own reporting table, separate from closed positions, giving you visibility into how often your strategy generates entries that never execute.
+
+## Listening to State Transitions
+
+Use `listenSignal` to observe every tick across all symbols in both backtest and live modes. Use `listenSignalBacktest` or `listenSignalLive` to scope your listener to one mode only. Use `listenActivePing` for targeted active-signal logic, `listenError` to catch validation and runtime errors, and `listenDone` to know when a background execution has finished.
+
+```typescript
+import {
+  addStrategySchema,
+  listenSignal,
+  listenSignalBacktest,
+  listenSignalLive,
+  listenActivePing,
+  listenError,
+  listenDone,
+  Log,
+  Position,
+  commitClosePending,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+  commitAverageBuy,
+} from "backtest-kit";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+const HARD_STOP = 25.0;
+const TARGET_PROFIT = 3;
+const LADDER_STEP_COST = 100;
+const LADDER_UPPER_STEP = 5;
+const LADDER_LOWER_STEP = 1;
+const LADDER_MAX_STEPS = 10;
+
+// Register the strategy — getSignal is called on every tick
+addStrategySchema({
+  strategyName: "apr_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: "long",
+      // Position.moonbag calculates TP = Infinity, SL = currentPrice * (1 - HARD_STOP/100)
+      ...Position.moonbag({
+        position: "long",
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: LADDER_STEP_COST,
+    };
+  },
+});
+
+// listenSignal fires on every tick result across both backtest and live runs
+listenSignal((result) => {
+  if (result.action === "closed") {
+    Log.info("signal closed", {
+      symbol: result.symbol,
+      closeReason: result.closeReason,
+    });
+  }
+});
+
+// listenSignalBacktest fires only during Backtest.background() / Backtest.run()
+listenSignalBacktest((result) => {
+  if (result.action === "opened") {
+    Log.info("backtest position opened", { symbol: result.symbol });
+  }
+});
+
+// listenSignalLive fires only during Live.background() / Live.run()
+listenSignalLive((result) => {
+  console.log(`[LIVE] ${result.symbol} → ${result.action}`);
+});
+
+// listenActivePing fires every minute while a signal is in the active state
+listenActivePing(async ({ symbol, currentPrice }) => {
+  // Check how many DCA rungs have been placed
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) {
+    return;
+  }
+
+  // Prevent placing a new DCA entry too close to an existing one
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) {
+    return;
+  }
+
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+// Second listenActivePing handler — close when profit target is reached
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  console.log(new Date(timestamp));
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) {
+    return;
+  }
+  Log.info("position closed due to the target pnl reached", { symbol, data });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: str.newline("# Closed by target pnl"),
+  });
+});
+
+// Global error handler keeps the process informed without crashing it
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+
+// listenDone fires when a background execution completes (backtest or live)
+listenDone(({ symbol, strategyName, backtest }) => {
+  console.log(`Run complete: ${strategyName} on ${symbol} (backtest=${backtest})`);
+});
+```
+
+<Tip>
+  You can attach multiple `listenActivePing` handlers to the same strategy. Each handler is invoked sequentially every minute, so you can split concerns cleanly — one handler for DCA logic, another for profit-target exits, another for trailing adjustments — without mixing unrelated code in a single function.
+</Tip>
+
+## Event Listener Reference
+
+| Function | Fires when | Mode |
+| --- | --- | --- |
+| `listenSignal` | Every tick result for any symbol | Backtest \+ Live |
+| `listenSignalBacktest` | Every tick result during `Backtest.run()` / `Backtest.background()` | Backtest only |
+| `listenSignalLive` | Every tick result during `Live.run()` / `Live.background()` | Live only |
+| `listenActivePing` | Every minute while a signal is in the active state | Backtest \+ Live |
+| `listenError` | Validation and background execution errors | Backtest \+ Live |
+| `listenDone` | Background execution complete for a symbol | Backtest \+ Live |
+
+## State Transition Summary
+
+| From | To | Trigger |
+| --- | --- | --- |
+| `idle` | `scheduled` | `getSignal` returns a signal with a limit `priceOpen` |
+| `idle` | `opened` | `getSignal` returns a market-entry signal (no `priceOpen`) |
+| `scheduled` | `opened` | Market price reaches `priceOpen` |
+| `scheduled` | `cancelled` | Timeout, `commitCancelScheduled`, or conflicting signal |
+| `opened` / `active` | `closed` | TP/SL breach, `minuteEstimatedTime` expiry, or `commitClosePending` |
+| `opened` / `active` | `active` | Each tick while position is open and TP/SL not yet reached |

@@ -1,0 +1,400 @@
+---
+title: "Monorepo Setup: Managing Multiple Strategies with CLI"
+sidebarTitle: "Monorepo"
+description: "Manage multiple strategies in one repo with @backtest-kit/cli. Share adapters and utilities while keeping each strategy's candle cache and config isolated."
+---
+
+`@backtest-kit/cli` is a monorepo-grade runner from day one. Each strategy lives in its own subdirectory with its own candle cache, broker modules, Telegram templates, and `.env` overrides. At the same time, the project root holds shared API keys and shared packages that every strategy can import. No framework migration is required when you go from one strategy to ten — only more files in the same tree.
+
+## How the CLI Handles Monorepos
+
+When the CLI loads your entry point, it changes the working directory to the file's location before executing any strategy code. Every relative path — `dump/`, `modules/`, `template/` — resolves inside the strategy's own folder, never the project root.
+
+Environment variables follow a two-step merge: the root `.env` is loaded first, then the strategy's local `.env` is loaded with override priority. This means shared credentials live at the root and each strategy can selectively override any variable it needs.
+
+Everything that follows — cache warming, report generation, module loading, template resolution — uses the strategy directory automatically. You never need to pass absolute paths or configure anything extra.
+
+## .env Loading Order
+
+Environment variables follow a two-step merge so you can keep shared credentials at the root and override anything per-strategy.
+
+<Steps>
+  <Step title="Root .env is loaded first">
+    Store API keys, Telegram tokens, and any credentials that are the same across all strategies here.
+
+    ```env
+    # .env (project root)
+    CC_TELEGRAM_TOKEN=your_bot_token
+    CC_TELEGRAM_CHANNEL=-100123456789
+    CC_WWWROOT_PORT=60050
+    EXCHANGE_API_KEY=shared_key
+    EXCHANGE_API_SECRET=shared_secret
+    ```
+  </Step>
+  <Step title="Strategy .env is loaded second (overrides root)">
+    Each strategy can override any variable — for example, to use a different exchange account or a separate Telegram channel.
+
+    ```env
+    # strategies/dec_2025/.env
+    EXCHANGE_API_KEY=strategy_specific_key
+    CC_TELEGRAM_CHANNEL=-100987654321
+    ```
+  </Step>
+</Steps>
+
+## Project Structure
+
+A production monorepo places each strategy in a named subdirectory under a shared parent. The root holds the `package.json` with one script per strategy and a single `.env` for shared secrets.
+
+```text
+monorepo/
+├── package.json                  # root scripts — one per strategy
+├── .env                          # shared API keys (exchange, Telegram, etc.)
+└── strategies/
+    ├── oct_2025/
+    │   ├── index.mjs             # entry point — registers exchange/frame/strategy schemas
+    │   ├── .env                  # overrides root .env for this strategy
+    │   ├── modules/
+    │   │   ├── live.module.mjs       # broker adapter for --live mode
+    │   │   ├── paper.module.mjs      # broker adapter for --paper mode
+    │   │   └── backtest.module.mjs   # broker adapter for --backtest mode
+    │   ├── template/             # custom Mustache templates for Telegram (optional)
+    │   └── dump/                 # auto-created: candle cache + backtest reports
+    └── dec_2025/
+        ├── index.mjs
+        ├── .env
+        ├── modules/
+        │   └── live.module.mjs
+        └── dump/
+```
+
+## Root `package.json`
+
+Add one script per strategy to the root `package.json`. You run any strategy from the project root — the CLI changes the working directory automatically.
+
+```json
+{
+  "scripts": {
+    "backtest:oct": "npx @backtest-kit/cli --backtest ./strategies/oct_2025/index.mjs",
+    "backtest:dec": "npx @backtest-kit/cli --backtest ./strategies/dec_2025/index.mjs",
+    "paper:oct":    "npx @backtest-kit/cli --paper    ./strategies/oct_2025/index.mjs",
+    "paper:dec":    "npx @backtest-kit/cli --paper    ./strategies/dec_2025/index.mjs",
+    "start:oct":    "npx @backtest-kit/cli --live --ui --telegram ./strategies/oct_2025/index.mjs",
+    "start:dec":    "npx @backtest-kit/cli --live --ui --telegram ./strategies/dec_2025/index.mjs"
+  },
+  "dependencies": {
+    "@backtest-kit/cli": "latest",
+    "backtest-kit": "latest",
+    "ccxt": "latest"
+  }
+}
+```
+
+```bash
+npm run backtest:oct
+npm run backtest:dec
+```
+
+## Isolated Resources Per Strategy
+
+Each strategy run produces its own `dump/` directory. Candle cache, reports, broker modules, and templates are all scoped to the strategy directory — not the project root.
+
+| Resource | Path (relative to strategy dir) | Isolated |
+| --- | --- | --- |
+| Candle cache | `./dump/data/candle/` | ✅ per-strategy |
+| Backtest reports | `./dump/` | ✅ per-strategy |
+| Broker module (live) | `./modules/live.module.mjs` | ✅ per-strategy |
+| Broker module (paper) | `./modules/paper.module.mjs` | ✅ per-strategy |
+| Broker module (backtest) | `./modules/backtest.module.mjs` | ✅ per-strategy |
+| Walker config module | `./modules/walker.module.mjs` | ✅ loaded once per run |
+| Telegram templates | `./template/*.mustache` | ✅ per-strategy |
+| Environment variables | `./.env` (overrides root) | ✅ per-strategy |
+
+<Tip>
+  Each strategy's `dump/` directory is self-contained, making it straightforward to point an AI agent at a specific strategy folder for analysis and report summarisation.
+</Tip>
+
+## Shared Import Aliases
+
+`@backtest-kit/cli` automatically turns every top-level folder in `process.cwd()` into a bare import alias. You create the folder, and any strategy file in the project can import from it by folder name — no relative path hell, no manual configuration.
+
+### How It Works
+
+When the CLI loads a strategy file, it scans the current working directory for sub-directories and registers each one as an import alias. The alias name equals the folder name. Both barrel imports and deep subpath imports are supported.
+
+| Import | Resolves to |
+| --- | --- |
+| `import { fn } from "utils"` | `<cwd>/utils/index.ts` (or `.js`, `.mjs`, `.cjs`) |
+| `import { calcRSI } from "math/rsi"` | `<cwd>/math/rsi.ts` |
+| `import { research } from "logic"` | `<cwd>/logic/index.ts` |
+| `import { ResearchResponseContract } from "logic/contract/ResearchResponse.contract"` | `<cwd>/logic/contract/ResearchResponse.contract.ts` |
+
+### Alias Project Structure
+
+```text
+my-project/
+├── utils/                    ← import { formatDate } from "utils"
+│   └── index.ts
+├── math/                     ← import { calcRSI } from "math/rsi"
+│   └── rsi.ts
+├── logic/                    ← import { research } from "logic"
+│   ├── index.ts              ←   barrel import
+│   └── contract/
+│       └── ResearchResponse.contract.ts  ← deep subpath import
+└── content/
+    ├── feb_2026.strategy.ts  ← uses all three aliases freely
+    └── mar_2026.strategy.ts  ← same aliases, no duplication
+```
+
+This lets you extract shared utilities, math helpers, or AI agent workflows into named folders and reuse them across every strategy in the project.
+
+### TypeScript Support
+
+Add matching `paths` entries to your `tsconfig.json` so the editor resolves the same aliases that the CLI registers at runtime:
+
+```json
+{
+  "compilerOptions": {
+    "moduleResolution": "bundler",
+    "paths": {
+      "logic":   ["./logic/index.ts"],
+      "logic/*": ["./logic/*"],
+      "math":    ["./math/index.ts"],
+      "math/*":  ["./math/*"],
+      "utils":   ["./utils/index.ts"],
+      "utils/*": ["./utils/*"]
+    }
+  },
+  "include": [
+    "./logic",
+    "./math",
+    "./utils",
+    "./content",
+    "./modules"
+  ]
+}
+```
+
+<Note>
+  The import alias is automatically applied to all modules loaded in the current process — it is not per-strategy. All strategies in the monorepo share the same alias table for the duration of a single CLI run.
+</Note>
+
+## Multi-Symbol Parallel Runs (`--entry`)
+
+For advanced setups, use `--entry` to fan one strategy out across many symbols at once, or to drive `*.background()` calls from a database, UI, or external API.
+
+Combine `--entry` with exactly one mode flag (`--backtest`, `--live`, `--paper`, or `--walker`). The CLI handles the environment boilerplate — `.env` loading, `--ui` / `--telegram` providers, module hooks, and SIGINT shutdown — while your entry file decides the symbol set and calls `*.background()` directly.
+
+```bash
+npx @backtest-kit/cli --backtest --entry ./src/multi-symbol.mjs
+```
+
+```javascript
+// src/multi-symbol.mjs
+import {
+  addExchangeSchema,
+  addFrameSchema,
+  addStrategySchema,
+  Backtest,
+} from 'backtest-kit';
+import ccxt from 'ccxt';
+
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+addFrameSchema({
+  frameName: 'feb-2026',
+  interval: '1m',
+  startDate: new Date('2026-02-01'),
+  endDate: new Date('2026-02-28'),
+});
+
+addStrategySchema({
+  strategyName: 'my-strategy',
+  interval: '15m',
+  getSignal: async () => null,
+});
+
+// Pick the symbol set from a list, database, or API
+const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
+
+for (const symbol of symbols) {
+  Backtest.background(symbol, {
+    strategyName: 'my-strategy',
+    exchangeName: 'binance',
+    frameName: 'feb-2026',
+  });
+}
+```
+
+The same pattern works for `--live --entry` and `--paper --entry` — just call `Live.background()` per symbol with your broker adapter wired up in `modules/live.module.mjs`.
+
+## `config/setup.config` — Shared Persistence Registration
+
+The CLI loads `{projectRoot}/config/setup.config` once before any module hooks or strategy code runs. Use it to swap the default file-based persistence for a production backend.
+
+<Warning>
+  When `setup.config` is present, the CLI skips its own default adapter registration entirely. Your config takes full ownership of the persistence layer — whatever adapters you register here are the only ones `backtest-kit` uses.
+</Warning>
+
+The most common use-case is MongoDB \+ Redis persistence via `@backtest-kit/mongo`:
+
+```bash
+npm install @backtest-kit/mongo
+```
+
+```ts
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup();
+```
+
+```env
+# .env
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-kit
+CC_REDIS_HOST=127.0.0.1
+CC_REDIS_PORT=6379
+```
+
+No changes to strategy code are required — `setup()` wires all 15 persistence adapters transparently before `backtest-kit` makes its first persistence call.
+
+You can also pass connection parameters explicitly if you prefer not to use environment variables:
+
+```ts
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup({
+  CC_MONGO_CONNECTION_STRING: 'mongodb://mongo:27017/mydb',
+  CC_REDIS_HOST: 'redis',
+  CC_REDIS_PORT: 6379,
+  CC_REDIS_PASSWORD: 'secret',
+});
+```
+
+## `config/loader.config` — Shared Service Wiring
+
+The CLI loads `{projectRoot}/config/loader.config` after `setup.config` but before any strategy or module code runs. Unlike `setup.config` (loaded for side effects), `loader.config` exports a function that the CLI explicitly `await`s. Use it whenever you need to wait for an async dependency before the backtest starts.
+
+**When to use it:**
+
+- **Wire a monorepo** — resolve and pre-load sibling packages, register cross-package services, or hydrate a shared service container before strategies import from neighbouring workspaces
+- **Wait for a database connection** — open Mongo/Postgres/Redis and verify it's reachable before the first persistence call, so the run fails fast instead of mid-run
+- **Warm up external APIs** — pre-fetch reference data (instruments list, fee tables, calendar) so the strategy's first tick doesn't pay the round-trip cost
+- **Run schema migrations** — apply pending migrations before signals start flowing
+
+Two export styles are supported — `export default` and `export const loader`. Never use both at once; if both are present, `default` wins.
+
+<CodeGroup>
+
+```ts Default export (preferred)
+// config/loader.config.ts
+import mongoose from 'mongoose';
+
+export default async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+  console.log('mongo connection verified, starting backtest');
+};
+```
+
+```ts Named export
+// config/loader.config.ts
+import mongoose from 'mongoose';
+
+export const loader = async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+};
+```
+
+</CodeGroup>
+
+### Example: Wait for MongoDB Before Running a Backtest
+
+`@backtest-kit/mongo`'s `setup()` registers adapters synchronously but does not block until the connection is established. Use `loader.config` to gate the run on a real connection:
+
+```ts
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+setup();
+```
+
+```ts
+// config/loader.config.ts
+import mongoose from 'mongoose';
+
+export default async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+  console.log('mongo connection verified, starting backtest');
+};
+```
+
+### Example: Stitch Microfrontends in a Monorepo
+
+When strategies live in one workspace and shared services live in sibling workspaces, `loader.config` is the place to wire them before the runner starts:
+
+```ts
+// config/loader.config.ts
+import "@my-org/brokers";
+import "@my-org/signals";
+```
+
+<Note>
+  Declare `@my-org/*` aliases in `config/alias.config` so the CLI resolves them to the correct local packages.
+</Note>
+
+## `config/alias.config` — Module Aliasing
+
+`@backtest-kit/cli` lets you override any Node.js module import without touching strategy code. Drop a `config/alias.config` file in your project root and export a mapping from module name to replacement module.
+
+The alias table is loaded once and applied globally via `require`/`import` interception. Use it to replace heavy dependencies with stubs for backtesting or swap exchange clients during CI.
+
+<CodeGroup>
+
+```ts TypeScript (named export)
+// config/alias.config.ts
+export const ccxt = require("./stubs/ccxt.stub.cjs");
+```
+
+```js CommonJS (default export)
+// config/alias.config.cjs
+module.exports = {
+  ccxt: require("./stubs/ccxt.stub.cjs"),
+};
+```
+
+```js ES Module (default export)
+// config/alias.config.mjs
+import ccxtStub from "./stubs/ccxt.stub.mjs";
+
+export default {
+  ccxt: ccxtStub,
+};
+```
+
+</CodeGroup>
+
+For ESM-only packages that cannot be loaded with `require`, export an async factory instead. The CLI `await`s it before any strategy code runs:
+
+```ts
+// config/alias.config.ts — async factory
+export default async () => ({
+  // nanoid is ESM-only — dynamic import is required
+  nanoid: await import("nanoid"),
+  "p-limit": await import("p-limit"),
+});
+```
+
+<Warning>
+  `config/alias.config` applies to all modules loaded in the current process — it is not per-strategy. A stub registered here affects every strategy running in the same CLI invocation.
+</Warning>

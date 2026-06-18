@@ -1,0 +1,407 @@
+---
+title: "How to Deploy Strategies to Live and Paper Trading"
+sidebarTitle: "Live Trading"
+description: "Deploy Backtest Kit strategies to paper or live trading using the CLI, broker adapter module, and environment variables for API keys."
+---
+
+Moving a strategy from backtest to live trading in Backtest Kit requires no changes to your strategy code. The same `getSignal` function, the same `listenActivePing` handlers, and the same `Position` helpers all run identically in production. The only addition is a **broker adapter** — a small module that tells the framework how to execute orders on a real exchange. The framework calls your adapter before updating any internal state, so exchange failures can never desynchronize your bot from the exchange.
+
+<Warning>
+  Always validate your strategy in paper mode for at least 30 days before enabling live trading with real capital. A strategy that looks profitable in backtests can behave very differently under live market conditions including real slippage, liquidity gaps, and API latency.
+</Warning>
+
+---
+
+## Paper Mode vs Live Mode
+
+Both modes use live exchange prices and run your strategy in real time. The difference is whether real orders are placed.
+
+|  | Paper Mode | Live Mode |
+| --- | --- | --- |
+| **Prices** | Live exchange data | Live exchange data |
+| **Orders** | Simulated internally | Sent to exchange via broker adapter |
+| **Capital** | Virtual | Real |
+| **API keys needed** | For price data only | For price data \+ order execution |
+| **CLI flag** | `--paper` | `--live` |
+| **Module file** | `modules/paper.module.mjs` | `modules/live.module.mjs` |
+
+Use paper mode to verify that your strategy generates signals at a reasonable frequency, that the broker adapter wiring is correct, and that event listeners fire as expected — all without risking real funds.
+
+---
+
+## Creating a Broker Adapter
+
+A broker adapter is a class whose methods the framework calls at each trade lifecycle event. You register it in a module file that the CLI loads automatically based on the current mode.
+
+Create the file at `./modules/live.module.mjs` relative to your strategy entry point:
+
+```javascript
+// modules/live.module.mjs
+import { Broker } from "backtest-kit";
+import ccxt from "ccxt";
+
+// Initialize your exchange client
+const exchange = new ccxt.binance({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_API_SECRET,
+  enableRateLimit: true,
+  options: {
+    defaultType: "future",
+  },
+});
+
+class MyBroker {
+  async onSignalOpenCommit({ symbol, priceOpen, position }) {
+    const side = position === "long" ? "buy" : "sell";
+    await exchange.createMarketOrder(symbol, side, /* quantity */ 0.001);
+  }
+
+  async onSignalCloseCommit({ symbol, position }) {
+    const side = position === "long" ? "sell" : "buy";
+    await exchange.createMarketOrder(symbol, side, /* quantity */ 0.001);
+  }
+
+  async onPartialProfitCommit({ symbol, cost, currentPrice }) {
+    await exchange.createMarketOrder(
+      symbol,
+      "sell",
+      cost / currentPrice
+    );
+  }
+
+  async onAverageBuyCommit({ symbol, cost, currentPrice }) {
+    await exchange.createMarketOrder(
+      symbol,
+      "buy",
+      cost / currentPrice
+    );
+  }
+}
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+<Note>
+  The CLI looks for module files relative to your strategy's directory. The resolution order is: `.ts` → `.mjs` → `.cjs`. A missing module is a soft warning — not an error — so you can run a strategy without a broker adapter for paper simulation without any code changes.
+</Note>
+
+---
+
+## Available Broker Hooks
+
+All methods are optional. Unimplemented hooks are silently skipped. In backtest mode all broker calls are bypassed automatically — no adapter code runs.
+
+| Method | Payload type | Triggered when |
+| --- | --- | --- |
+| `onSignalOpenCommit` | `BrokerSignalOpenPayload` | Position is activated (entry price reached) |
+| `onSignalCloseCommit` | `BrokerSignalClosePayload` | Position closes via SL, TP, or manual close |
+| `onPartialProfitCommit` | `BrokerPartialProfitPayload` | A partial profit level is hit |
+| `onPartialLossCommit` | `BrokerPartialLossPayload` | A partial loss level is hit |
+| `onTrailingStopCommit` | `BrokerTrailingStopPayload` | Trailing stop-loss is adjusted |
+| `onTrailingTakeCommit` | `BrokerTrailingTakePayload` | Trailing take-profit is adjusted |
+| `onBreakevenCommit` | `BrokerBreakevenPayload` | Stop-loss is moved to breakeven |
+| `onAverageBuyCommit` | `BrokerAverageBuyPayload` | A DCA averaging entry is added |
+
+**TypeScript signature:**
+
+```typescript
+import {
+  Broker,
+  IBroker,
+  BrokerSignalOpenPayload,
+  BrokerSignalClosePayload,
+  BrokerAverageBuyPayload,
+  BrokerPartialProfitPayload,
+} from "backtest-kit";
+
+class MyBroker implements Partial<IBroker> {
+  async onSignalOpenCommit(payload: BrokerSignalOpenPayload) {
+    const { symbol, priceOpen, position, cost } = payload;
+    // Place your opening order here
+  }
+
+  async onSignalCloseCommit(payload: BrokerSignalClosePayload) {
+    const { symbol, priceClosed, position } = payload;
+    // Place your closing order here
+  }
+
+  async onAverageBuyCommit(payload: BrokerAverageBuyPayload) {
+    const { symbol, cost, currentPrice } = payload;
+    // Execute the DCA buy order here
+  }
+
+  async onPartialProfitCommit(payload: BrokerPartialProfitPayload) {
+    const { symbol, cost, currentPrice } = payload;
+    // Sell the partial position here
+  }
+}
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+---
+
+## Transactional Guarantees
+
+The broker adapter sits between your strategy and internal state mutations. **The framework never updates its internal position state until your adapter method succeeds.** This means:
+
+- If `onSignalOpenCommit` throws (e.g. exchange rejects the order due to insufficient margin), the position stays in its previous state and the framework retries on the next tick.
+- If `onAverageBuyCommit` throws (e.g. network timeout), the DCA entry is not recorded and the effective entry price is unchanged.
+- You never need to write rollback logic — the framework handles it automatically.
+
+```text
+Framework wants to open position
+    ↓
+Calls onSignalOpenCommit() in your adapter
+    ↓
+Exchange rejects (e.g. insufficient margin) → adapter throws
+    ↓
+Framework rolls back → position stays unchanged → retries next tick
+    ↓
+Exchange accepts → framework updates internal state → position is now "opened"
+```
+
+<Note>
+  Automatic retry continues until the commit succeeds or the strategy is manually cancelled. Transient errors (network timeout, rate limit) are handled transparently without any manual intervention.
+</Note>
+
+---
+
+## Environment Variables
+
+Store exchange API keys in a `.env` file in your strategy directory. The CLI loads it automatically before running the strategy. Use a root `.env` for shared keys and a strategy-level `.env` to override them:
+
+```env
+# .env
+BINANCE_API_KEY=your_api_key_here
+BINANCE_API_SECRET=your_api_secret_here
+
+# Web UI server (optional)
+CC_WWWROOT_HOST=0.0.0.0
+CC_WWWROOT_PORT=60050
+
+# Telegram notifications (optional)
+CC_TELEGRAM_TOKEN=your_bot_token
+CC_TELEGRAM_CHANNEL=-100123456789
+```
+
+Access the variables in your broker adapter using `process.env`:
+
+```javascript
+const exchange = new ccxt.binance({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_API_SECRET,
+});
+```
+
+<Warning>
+  Never commit real API keys to version control. Add `.env` to your `.gitignore` and use a secrets manager or environment variable injection in production Docker deployments.
+</Warning>
+
+---
+
+## Running Live Trading
+
+Start live trading for a single symbol:
+
+```bash
+npx @backtest-kit/cli --live ./strategy.ts --symbol BTCUSDT --ui
+```
+
+Start paper trading (no real orders, live prices):
+
+```bash
+npx @backtest-kit/cli --paper ./strategy.ts --symbol BTCUSDT --ui
+```
+
+Add Telegram notifications for every position event:
+
+```bash
+npx @backtest-kit/cli --live ./strategy.ts --symbol BTCUSDT --ui --telegram
+```
+
+Wire into `package.json`:
+
+```json
+{
+  "scripts": {
+    "paper": "npx @backtest-kit/cli --paper ./src/index.ts --symbol BTCUSDT --ui",
+    "start": "npx @backtest-kit/cli --live ./src/index.ts --symbol BTCUSDT --ui --telegram"
+  }
+}
+```
+
+---
+
+## Programmatic API
+
+You can drive live trading from code instead of the CLI. This is useful for multi-symbol setups, custom entry points, or integration with external systems.
+
+### `Live.background()`
+
+`Live.background()` starts live trading in the background and returns immediately, allowing multiple symbols to run in parallel within a single process:
+
+```typescript
+import {
+  addExchangeSchema,
+  addStrategySchema,
+  Live,
+  listenDone,
+} from "backtest-kit";
+
+addExchangeSchema({
+  exchangeName: "binance",
+  getCandles: async (symbol, interval, since, limit) => {
+    // ... fetch candles
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+addStrategySchema({
+  strategyName: "my-strategy",
+  interval: "15m",
+  getSignal: async (symbol) => null,
+});
+
+// Start live trading — non-blocking
+Live.background("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+});
+```
+
+### `Live.run()`
+
+`Live.run()` starts live trading and returns a `Promise` that resolves when the session ends (e.g. after a `SIGINT` or a manual stop call):
+
+```typescript
+import { Live } from "backtest-kit";
+
+await Live.run("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+});
+
+console.log("Live session ended");
+```
+
+Use the `--entry` CLI flag to tell the CLI you are managing `Live.background()` calls yourself:
+
+```bash
+npx @backtest-kit/cli --live --entry ./src/multi-symbol.ts
+```
+
+### Monitoring with `listenSignal`
+
+`listenSignal` fires on every signal lifecycle event during a live session — opened, active, scheduled, cancelled, closed. Use it to react programmatically, send custom notifications, or update an external dashboard:
+
+```typescript
+import { listenSignal } from "backtest-kit";
+
+listenSignal(({ action, symbol, signal }) => {
+  if (action === "opened") {
+    console.log(`[LIVE] ${symbol} position opened @ ${signal.priceOpen}`);
+  }
+  if (action === "closed") {
+    console.log(`[LIVE] ${symbol} position closed`);
+  }
+});
+```
+
+---
+
+## Graceful Shutdown
+
+When you press `Ctrl+C`, the CLI catches `SIGINT` and stops the live session gracefully. `Live.background()` waits for any in-flight tick to finish before shutting down — it does not interrupt a running `getSignal` call mid-execution. All open positions remain on the exchange; only the monitoring loop stops.
+
+A second `Ctrl+C` force-quits the process immediately if the graceful shutdown takes too long.
+
+<Note>
+  `Live.background()` does **not** automatically close open positions on shutdown. If you need to close all positions on exit, implement that logic in a `SIGINT` handler or use the web dashboard's manual close button before stopping the process.
+</Note>
+
+---
+
+## Complete Broker Adapter Example
+
+This full example shows all eight broker hooks wired to a CCXT exchange, with typed payloads and `Broker.enable()` at the end:
+
+```typescript
+// modules/live.module.mjs
+import { Broker } from "backtest-kit";
+import ccxt from "ccxt";
+
+const exchange = new ccxt.binance({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_API_SECRET,
+  enableRateLimit: true,
+  options: { defaultType: "future" },
+});
+
+const QUANTITY = 0.001; // Fixed quantity per trade for this example
+
+class BinanceBroker {
+  // ── Entry / Exit ────────────────────────────────────────────────
+
+  async onSignalOpenCommit({ symbol, priceOpen, position }) {
+    const side = position === "long" ? "buy" : "sell";
+    console.log(`[broker] open ${side} ${symbol} @ ${priceOpen}`);
+    await exchange.createMarketOrder(symbol, side, QUANTITY);
+  }
+
+  async onSignalCloseCommit({ symbol, position, priceClosed }) {
+    const side = position === "long" ? "sell" : "buy";
+    console.log(`[broker] close ${side} ${symbol} @ ${priceClosed}`);
+    await exchange.createMarketOrder(symbol, side, QUANTITY);
+  }
+
+  // ── Partial Closes ───────────────────────────────────────────────
+
+  async onPartialProfitCommit({ symbol, cost, currentPrice }) {
+    const qty = cost / currentPrice;
+    console.log(`[broker] partial profit ${symbol} qty=${qty.toFixed(6)}`);
+    await exchange.createMarketOrder(symbol, "sell", qty);
+  }
+
+  async onPartialLossCommit({ symbol, cost, currentPrice }) {
+    const qty = cost / currentPrice;
+    console.log(`[broker] partial loss ${symbol} qty=${qty.toFixed(6)}`);
+    await exchange.createMarketOrder(symbol, "sell", qty);
+  }
+
+  // ── DCA ──────────────────────────────────────────────────────────
+
+  async onAverageBuyCommit({ symbol, cost, currentPrice }) {
+    const qty = cost / currentPrice;
+    console.log(`[broker] DCA buy ${symbol} qty=${qty.toFixed(6)}`);
+    await exchange.createMarketOrder(symbol, "buy", qty);
+  }
+
+  // ── Trailing Adjustments ─────────────────────────────────────────
+
+  async onTrailingStopCommit({ symbol, newStopLoss }) {
+    console.log(`[broker] trailing stop ${symbol} → ${newStopLoss}`);
+    // Update stop-loss order on exchange if supported
+  }
+
+  async onTrailingTakeCommit({ symbol, newTakeProfit }) {
+    console.log(`[broker] trailing take ${symbol} → ${newTakeProfit}`);
+    // Update take-profit order on exchange if supported
+  }
+
+  // ── Breakeven ────────────────────────────────────────────────────
+
+  async onBreakevenCommit({ symbol, breakevenPrice }) {
+    console.log(`[broker] breakeven ${symbol} @ ${breakevenPrice}`);
+    // Move stop-loss order to breakeven price on exchange
+  }
+}
+
+Broker.useBrokerAdapter(BinanceBroker);
+Broker.enable();
+```
+
+The CLI automatically picks up this file when you run `--live`. If you run `--backtest` or `--paper` without a `paper.module.mjs`, all broker calls are silently skipped — your strategy logic runs exactly as written.

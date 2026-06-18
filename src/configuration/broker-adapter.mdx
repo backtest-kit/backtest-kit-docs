@@ -1,0 +1,237 @@
+---
+title: "Broker Adapter: Executing Live Trades in Backtest Kit"
+sidebarTitle: "Broker Adapter"
+description: "Build a custom broker adapter to execute real trades on any exchange. Use IBroker hooks and transactional guarantees for crash-safe live trading."
+---
+
+A broker adapter is the bridge between Backtest Kit's internal state machine and a real exchange. Every time the framework is about to mutate a position — open a trade, close it, add a DCA entry, adjust a trailing stop — it calls your adapter **before** updating its own state. If the exchange rejects the order or your adapter throws an exception, the framework rolls back to the previous state and retries on the next candle tick. You never write rollback logic manually; the framework's transactional guarantee handles it for you.
+
+## What a Broker Adapter Does
+
+Without a broker adapter, Backtest Kit manages positions entirely in memory (or in the configured persistence layer) and never touches a real exchange. This is correct for backtesting and paper trading. For live trading, you need the adapter to translate framework events into actual exchange API calls.
+
+The adapter intercepts eight specific lifecycle events, each corresponding to a distinct position mutation. You implement only the hooks you need — unimplemented hooks are silently skipped.
+
+## Where the Adapter Lives
+
+The CLI loads the broker adapter from a **mode-specific module file** located in your strategy's `modules/` directory. The file is loaded as a side-effect import before the trading harness starts:
+
+| Mode | Module file |
+| --- | --- |
+| `--live` | `modules/live.module.mjs` (or `.ts`, `.cjs`) |
+| `--paper` | `modules/paper.module.mjs` |
+| `--backtest` | `modules/backtest.module.mjs` |
+| `--walker` | `modules/walker.module.mjs` |
+| `--brokerdebug` | `modules/brokerdebug.module.mjs` |
+
+<Note>
+  In backtest mode, all broker hook calls are **automatically skipped** regardless of whether an adapter is registered. You can safely place a `backtest.module.mjs` in your strategy folder and the adapter will only fire in live and paper modes.
+</Note>
+
+The module file resolves relative to the strategy directory — the same directory the CLI changes to before loading your entry point.
+
+```text
+strategies/
+└── oct_2025/
+    ├── index.ts              ← strategy entry point
+    └── modules/
+        ├── live.module.ts    ← broker adapter for --live
+        └── paper.module.ts   ← broker adapter for --paper
+```
+
+## The `IBroker` Interface
+
+Your broker class implements `Partial<IBroker>` from `backtest-kit`. All eight hooks are optional — implement only what your exchange integration requires:
+
+| Hook | Payload Type | Triggered When |
+| --- | --- | --- |
+| `onSignalOpenCommit` | `BrokerSignalOpenPayload` | A new position is activated (entry price reached) |
+| `onSignalCloseCommit` | `BrokerSignalClosePayload` | A position closes via TP, SL, or manual close |
+| `onPartialProfitCommit` | `BrokerPartialProfitPayload` | A partial profit milestone is reached and executed |
+| `onPartialLossCommit` | `BrokerPartialLossPayload` | A partial loss milestone is reached and executed |
+| `onTrailingStopCommit` | `BrokerTrailingStopPayload` | The trailing stop-loss level is adjusted |
+| `onTrailingTakeCommit` | `BrokerTrailingTakePayload` | The trailing take-profit level is adjusted |
+| `onBreakevenCommit` | `BrokerBreakevenPayload` | The stop-loss is moved to the entry price |
+| `onAverageBuyCommit` | `BrokerAverageBuyPayload` | A DCA entry is added to the position |
+
+## Transactional Guarantee
+
+Every broker operation follows this sequence:
+
+1. The framework prepares the commit payload with all relevant position data.
+2. Your broker adapter executes the exchange API call.
+3. **If the adapter returns successfully** → the framework updates its internal state.
+4. **If the adapter throws** → the internal state is left unchanged; the framework logs the error and retries on the next candle tick.
+
+This means your strategy's internal representation is always consistent with what the exchange has confirmed. You cannot end up in a state where Backtest Kit thinks a position is open but the exchange rejected the order — if the exchange rejects, the framework never records the position as open.
+
+<Warning>
+  Do not swallow exceptions inside your adapter hooks. If the exchange call fails, let the exception propagate. Catching errors silently and returning normally will cause the framework to record a state change that the exchange never confirmed.
+</Warning>
+
+## Registering the Adapter
+
+Inside your module file, instantiate your adapter class and pass it to `Broker.useBrokerAdapter()`, then call `Broker.enable()` to activate the interception layer:
+
+```typescript
+import { Broker } from 'backtest-kit';
+import { MyBroker } from './my-broker';
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+`Broker.useBrokerAdapter()` accepts a **class reference** (not an instance). The framework instantiates it internally so that it can bind the correct execution context.
+
+## Complete TypeScript Broker Adapter Example
+
+The following example shows a full broker adapter for a hypothetical CCXT-based exchange integration. It implements the four most common hooks — open, close, partial profit, and DCA — and delegates order placement to a shared exchange client:
+
+```typescript
+// modules/live.module.ts
+import {
+  Broker,
+  IBroker,
+  BrokerSignalOpenPayload,
+  BrokerSignalClosePayload,
+  BrokerPartialProfitPayload,
+  BrokerAverageBuyPayload,
+} from 'backtest-kit';
+import ccxt from 'ccxt';
+
+// Shared exchange client — initialize once, reuse across hooks.
+const exchange = new ccxt.binance({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_API_SECRET,
+  enableRateLimit: true,
+});
+
+class LiveBroker implements Partial<IBroker> {
+
+  /**
+   * Called when a new position is activated.
+   * Place the opening market order here.
+   */
+  async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+    const { symbol, priceOpen, position, cost } = payload;
+    const side = position === 'long' ? 'buy' : 'sell';
+    const quantity = cost / priceOpen;
+
+    console.log(`Opening ${position} on ${symbol} @ ${priceOpen}`);
+
+    await exchange.createOrder(symbol, 'market', side, quantity);
+  }
+
+  /**
+   * Called when a position closes via TP, SL, or commitClosePending.
+   * Place the closing order here.
+   */
+  async onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void> {
+    const { symbol, priceClosed, position } = payload;
+    // Close the opposite side of the original position.
+    const side = position === 'long' ? 'sell' : 'buy';
+
+    console.log(`Closing ${position} on ${symbol} @ ${priceClosed}`);
+
+    // Fetch the actual open position size from the exchange
+    // to avoid quantity drift from partial fills.
+    const positionData = await exchange.fetchPosition(symbol);
+    const quantity = Math.abs(positionData?.contracts ?? 0);
+
+    if (quantity > 0) {
+      await exchange.createOrder(symbol, 'market', side, quantity);
+    }
+  }
+
+  /**
+   * Called when a partial profit milestone is reached.
+   * Reduce the position by the specified cost amount.
+   */
+  async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
+    const { symbol, cost, currentPrice, position } = payload;
+    const side = position === 'long' ? 'sell' : 'buy';
+    const quantity = cost / currentPrice;
+
+    console.log(`Partial profit on ${symbol}: reducing by ${quantity.toFixed(6)}`);
+
+    await exchange.createOrder(symbol, 'market', side, quantity);
+  }
+
+  /**
+   * Called when a DCA entry is added to the position.
+   * Place an additional buy order to average into the position.
+   */
+  async onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void> {
+    const { symbol, cost, currentPrice, position } = payload;
+    const side = position === 'long' ? 'buy' : 'sell';
+    const quantity = cost / currentPrice;
+
+    console.log(`DCA entry on ${symbol}: adding ${quantity.toFixed(6)} @ ${currentPrice}`);
+
+    await exchange.createOrder(symbol, 'market', side, quantity);
+  }
+}
+
+// Register the adapter class (not an instance) and enable interception.
+Broker.useBrokerAdapter(LiveBroker);
+Broker.enable();
+```
+
+## TypeScript Interface Signature
+
+If you prefer to lean on the TypeScript compiler to enforce the interface, use the `implements Partial<IBroker>` signature:
+
+```typescript
+import { Broker, IBroker, BrokerSignalOpenPayload, BrokerSignalClosePayload } from 'backtest-kit';
+
+class MyBroker implements Partial<IBroker> {
+  async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+    // place open order on exchange
+  }
+
+  async onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void> {
+    // place close order on exchange
+  }
+}
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+## Testing Broker Hooks with `--brokerdebug`
+
+Before running live trading, you can verify that your adapter correctly wires up exchange calls using the `--brokerdebug` flag. The CLI fetches the last candle for the specified symbol, derives synthetic payload values (TP = \+2%, SL = −2% from current price), and fires the selected broker hook once:
+
+```bash
+# Test the signal-open hook
+npx @backtest-kit/cli --brokerdebug --commit signal-open --symbol BTCUSDT
+
+# Test the partial-profit hook
+npx @backtest-kit/cli --brokerdebug --commit partial-profit --symbol ETHUSDT
+```
+
+The CLI loads your adapter from `modules/brokerdebug.module` (same directory resolution rules as other modes). Create a separate debug module so you can add logging or use a testnet endpoint without affecting your production adapter:
+
+```typescript
+// modules/brokerdebug.module.ts
+import { Broker } from 'backtest-kit';
+import { MyBroker } from './my-broker-testnet'; // testnet version
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+**Available `--commit` values:**
+
+| Value | Fires Hook |
+| --- | --- |
+| `signal-open` | `onSignalOpenCommit` |
+| `signal-close` | `onSignalCloseCommit` |
+| `partial-profit` | `onPartialProfitCommit` |
+| `partial-loss` | `onPartialLossCommit` |
+| `average-buy` | `onAverageBuyCommit` |
+| `trailing-stop` | `onTrailingStopCommit` |
+| `trailing-take` | `onTrailingTakeCommit` |
+| `breakeven` | `onBreakevenCommit` |
+
+The process exits with code `0` on success and a non-zero code if the adapter throws, making it easy to integrate into a CI pipeline that validates broker connectivity before deployment.

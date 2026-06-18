@@ -1,0 +1,307 @@
+---
+title: "Pine Script Range Breakout Strategy with Backtest Kit"
+sidebarTitle: "Pine Script"
+description: "Use @backtest-kit/pinets to run a TradingView Pine Script range breakout strategy in Node.js. Execute Pine Script v5/v6 with zero rewriting."
+---
+
+Traders have thousands of hours invested in TradingView Pine Script indicators. Rewriting them in TypeScript or JavaScript means reimplementing the Pine runtime, every built-in function, and the exact numerical behavior of TradingView's execution model — a project that introduces subtle differences and defeats the purpose. The `@backtest-kit/pinets` package solves this by running Pine Script v5/v6 natively inside Node.js, letting you call your existing `.pine` file as if it were a TypeScript function and read its output plots as typed values. The Pine Script Range Breakout strategy demonstrates this pattern: a Bollinger Band range detector written in Pine runs on hourly candles, and a TypeScript strategy reads its outputs to fire LONG/SHORT signals with a fixed ±2% bracket.
+
+## Strategy Overview
+
+The strategy runs a Pine Script indicator (`btc_dec2025_range.pine`) on BTCUSDT 1h candles every hour. The indicator computes Bollinger Bands, detects horizontal range boundaries, and emits a directional signal (\+1 or −1) when price breaks out of the range with a volume spike. The TypeScript `getSignal` reads those outputs, applies a few filters, and opens a \$100 bracket position (±2% TP/SL). No DCA, no trailing, no time-based exit — the bracket handles everything.
+
+## How It Works
+
+<Steps>
+  <Step title="Run the Pine indicator on 1h candles via Cache.fn">
+    `Cache.fn` executes the Pine Script indicator once per hour and caches the result for the rest of that hour's ticks. This prevents redundant computation while keeping the output aligned to the candle boundary — an important detail for preventing look-ahead bias. Backtest Kit's ambient temporal context ensures the candle fetch inside the cache function can never see candles from the future.
+
+    ```typescript
+    import { File, run } from "@backtest-kit/pinets";
+    import { Cache } from "backtest-kit";
+    
+    const getPineSignal = Cache.fn(
+      "dec-2025-pine-signal",
+      async (symbol: string) => {
+        const source = File.fromPath("./indicators/btc_dec2025_range.pine");
+        return run(source, { symbol, timeframe: "1h", limit: 100 });
+      },
+      { intervalMs: 60 * 60 * 1000 }   // Re-run at most once per hour
+    );
+    ```
+  </Step>
+  <Step title="Extract multiple outputs from the Pine indicator">
+    `run` returns an object keyed by the plot names declared in your `.pine` file. Each value is the last computed bar's output. You destructure the outputs you need:
+
+    ```typescript
+    const plot = await getPineSignal(symbol);
+    
+    const {
+      signal,      // +1 = bullish breakout, −1 = bearish breakout, 0 = no signal
+      isRanging,   // 1 = price still inside range — skip signal
+      volSpike,    // 1 = volume confirmation present
+      bbUpper,     // Bollinger Band upper
+      bbLower,     // Bollinger Band lower
+      bbBasis,     // Bollinger Band mid-line (signal line)
+      rangeHigh,   // Detected range ceiling
+      rangeLow,    // Detected range floor
+      close,       // Close of the signal bar
+    } = plot;
+    ```
+
+    <Tip>
+      Every plot you want to read in TypeScript **must** include `display=display.data_window` in its `plot()` call inside the Pine script. Plots without this flag are marked as visual-only and are not exported to the runtime output object. Without it, the value will be `undefined` in your TypeScript code.
+    </Tip>
+  </Step>
+  <Step title="Filter signals based on market state">
+    Before opening a position, you apply two filters that prevent acting on stale or low-quality signals:
+
+    1. **Price already moved past the signal close** — If `currentPrice > plot.close` for a LONG, price has already run up since the signal bar closed. The entry would be chasing. Skip it.
+    2. **Market is still ranging** — If `isRanging === 1`, the breakout hasn't been confirmed yet. Skip.
+
+    ```typescript
+    getSignal: async (symbol, when, currentPrice) => {
+      const plot = await getPineSignal(symbol);
+    
+      if (plot.signal === 1) {
+        // LONG: skip if price already ran past the signal close
+        if (currentPrice > plot.close) return null;
+        // LONG: skip if still ranging
+        if (plot.isRanging === 1) return null;
+    
+        return {
+          position: "long",
+          ...Position.bracket({
+            position: "long",
+            currentPrice,
+            percentTakeProfit: 2,
+            percentStopLoss: 2,
+          }),
+          minuteEstimatedTime: Infinity,
+          cost: 100,
+        };
+      }
+    
+      if (plot.signal === -1) {
+        // SHORT: skip if price already ran past the signal close
+        if (currentPrice < plot.close) return null;
+        // SHORT: skip if still ranging
+        if (plot.isRanging === 1) return null;
+    
+        return {
+          position: "short",
+          ...Position.bracket({
+            position: "short",
+            currentPrice,
+            percentTakeProfit: 2,
+            percentStopLoss: 2,
+          }),
+          minuteEstimatedTime: Infinity,
+          cost: 100,
+        };
+      }
+    
+      return null;   // No signal from Pine — wait
+    },
+    ```
+  </Step>
+  <Step title="Fixed ±2% bracket closes the position">
+    `Position.bracket` sets a symmetric ±2% take-profit and stop-loss. There is no DCA, no trailing, and no active-ping listener in this strategy — once the position is open, the bracket handles the exit entirely. This keeps the strategy simple and its results easy to attribute to the Pine indicator's quality.
+  </Step>
+</Steps>
+
+## The Pine Script Indicator
+
+Below is a representative structure of the `btc_dec2025_range.pine` indicator. The key requirement is that every value you need in TypeScript is exported via `plot()` with `display=display.data_window`.
+
+```pine
+//@version=5
+indicator("BTC Range Breakout", overlay=true)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────────
+rsiLength   = input.int(14,  title="RSI Length")
+bbLength    = input.int(20,  title="BB Length")
+bbMult      = input.float(2.0, title="BB Multiplier")
+volLookback = input.int(20,  title="Volume Lookback")
+
+// ─── Bollinger Bands ─────────────────────────────────────────────────────────
+bbBasis = ta.sma(close, bbLength)
+bbDev   = bbMult * ta.stdev(close, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+// ─── Range detection ─────────────────────────────────────────────────────────
+rangeHigh = ta.highest(high, 20)
+rangeLow  = ta.lowest(low,  20)
+rangeSize = rangeHigh - rangeLow
+
+// Price is "ranging" when it sits between the BB bands and range is compressed
+isRanging = close > bbLower and close < bbUpper and rangeSize < bbDev * 2 ? 1 : 0
+
+// ─── Volume spike ────────────────────────────────────────────────────────────
+avgVol   = ta.sma(volume, volLookback)
+volSpike = volume > avgVol * 1.5 ? 1 : 0
+
+// ─── Breakout signal ─────────────────────────────────────────────────────────
+breakoutLong  = close > rangeHigh and volSpike == 1
+breakoutShort = close < rangeLow  and volSpike == 1
+
+signal = breakoutLong ? 1 : breakoutShort ? -1 : 0
+
+// ─── Exports (display.data_window required for TypeScript extraction) ─────────
+plot(bbUpper,    "bbUpper",    display=display.data_window)
+plot(bbLower,    "bbLower",    display=display.data_window)
+plot(bbBasis,    "bbBasis",    display=display.data_window)
+plot(rangeHigh,  "rangeHigh",  display=display.data_window)
+plot(rangeLow,   "rangeLow",   display=display.data_window)
+plot(signal,     "signal",     display=display.data_window)
+plot(isRanging,  "isRanging",  display=display.data_window)
+plot(volSpike,   "volSpike",   display=display.data_window)
+
+// Visual overlays (no display.data_window — not exported to TypeScript)
+plot(bbUpper, "BB Upper Visual", color=color.blue)
+plot(bbLower, "BB Lower Visual", color=color.blue)
+```
+
+## Testing the Indicator Standalone with `--pine`
+
+Before wiring the indicator into a full strategy, you can validate its outputs on live candle data using the `--pine` CLI flag. This runs the indicator in isolation and prints all exported plot values for each candle bar:
+
+```bash
+npm start -- --pine ./indicators/btc_dec2025_range.pine \
+  --symbol BTCUSDT \
+  --interval 1h \
+  --bars 50
+```
+
+The output shows the raw plot values for each bar, letting you confirm that `signal`, `isRanging`, and `volSpike` are producing expected values before you build the TypeScript strategy around them. This is especially useful when porting an existing Pine indicator that has complex internal state — you can compare the `--pine` output directly against what TradingView shows.
+
+## Full Strategy Code
+
+```typescript
+import {
+  addStrategySchema,
+  listenError,
+  Log,
+  Position,
+  Cache,
+} from "backtest-kit";
+import { File, run } from "@backtest-kit/pinets";
+import { errorData, getErrorMessage } from "functools-kit";
+
+// Cache the Pine execution to once per hour.
+// The ambient temporal context in the cache key ensures backtest
+// and live modes use the same logic without look-ahead bias.
+const getPineSignal = Cache.fn(
+  "dec-2025-pine-signal",
+  async (symbol: string) => {
+    const source = File.fromPath(
+      "./content/dec_2025.strategy/btc_dec2025_range.pine"
+    );
+    return run(source, { symbol, timeframe: "1h", limit: 100 });
+  },
+  { intervalMs: 60 * 60 * 1000 }
+);
+
+addStrategySchema({
+  strategyName: "dec_2025_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    const plot = await getPineSignal(symbol);
+
+    // LONG signal
+    if (plot.signal === 1) {
+      if (currentPrice > plot.close) return null;   // already ran up
+      if (plot.isRanging === 1)      return null;   // still inside range
+
+      return {
+        position: "long",
+        ...Position.bracket({
+          position: "long",
+          currentPrice,
+          percentTakeProfit: 2,
+          percentStopLoss: 2,
+        }),
+        minuteEstimatedTime: Infinity,
+        cost: 100,
+      };
+    }
+
+    // SHORT signal
+    if (plot.signal === -1) {
+      if (currentPrice < plot.close) return null;   // already ran down
+      if (plot.isRanging === 1)      return null;   // still inside range
+
+      return {
+        position: "short",
+        ...Position.bracket({
+          position: "short",
+          currentPrice,
+          percentTakeProfit: 2,
+          percentStopLoss: 2,
+        }),
+        minuteEstimatedTime: Infinity,
+        cost: 100,
+      };
+    }
+
+    return null;   // No Pine signal — skip
+  },
+});
+
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+## Backtest Results — December 2025
+
+December 2025 (first half) was a choppy, high-volatility period. BTC oscillated between ~$85k and ~$94k with sharp intra-day reversals — a regime that tests the indicator's ability to distinguish genuine breakouts from false ones.
+
+| Metric | Value |
+| --- | --- |
+| Total trades | 9 |
+| Long / Short split | 6 LONG / 3 SHORT |
+| Total deployed capital | \$900 |
+| Net PnL | **\+\$2.40** (\+2.40%) |
+| Win rate | 66.7% (6 / 9) |
+| Best trade | \+\$1.61 (Dec 1, SHORT) |
+| Worst trade | −\$2.41 (Dec 5, SHORT — false breakout) |
+| Worst drawdown (%) | **−2.35%** |
+| Avg hold time | ~1,189 min (~20 hours) |
+| **Sharpe ratio** | **0.06** |
+
+The three losing trades all hit the hard 2% stop-loss. Trades 4 and 7 were false breakouts — price briefly broke direction then reversed. Trade 5 was a long entry at the period high (\$94,171) that immediately reversed. Trade 6 (the only win without a volume confirmation) still hit take-profit, demonstrating that `volSpike` is a filter rather than a hard requirement — but it reduces false-breakout rate.
+
+## When to Use Pine Script Integration
+
+Pine Script integration is the right choice when:
+
+- You already have a working TradingView indicator and want to backtest it against real data without a rewrite.
+- Your indicator uses built-in TradingView functions (`ta.sma`, `ta.stdev`, `ta.highest`, etc.) that would take days to port correctly to TypeScript.
+- You want to iterate on the indicator logic in TradingView's visual editor and then re-run the Backtest Kit backtest without touching the TypeScript strategy code.
+- You need to compare multiple Pine indicator variants quickly using the `--walker` A/B testing mode.
+
+<Note>
+  The `@backtest-kit/pinets` package supports Pine Script v5 and v6. Most community indicators on TradingView use v5. If you copy a script from the TradingView library, check the `//@version=` declaration at the top — v4 scripts require minor syntax updates before they will run.
+</Note>
+
+## Running the Backtest
+
+```bash
+npm start -- --backtest --symbol BTCUSDT \
+  --strategy dec_2025_strategy \
+  --exchange ccxt-exchange \
+  --frame dec_2025_frame \
+  ./content/dec_2025.strategy/dec_2025.strategy.ts
+```
+
+Add `--ui` to open the web dashboard at `http://localhost:60050`:
+
+```bash
+npm start -- --backtest --symbol BTCUSDT --ui \
+  ./content/dec_2025.strategy/dec_2025.strategy.ts
+```

@@ -1,0 +1,251 @@
+---
+title: "Environment Variables and Config Files in Backtest Kit"
+sidebarTitle: "Environment"
+description: "Configure Backtest Kit via .env files, setup.config, loader.config, and alias.config for exchange keys, UI settings, and persistence."
+---
+
+Backtest Kit reads configuration from two complementary sources: environment variables (set in `.env` files or your shell) and TypeScript config files placed in a `config/` directory next to your strategy. The environment variables control external services — Telegram, the web dashboard, MongoDB, Redis — while the config files let you hook into the framework's startup sequence to customize persistence, dependency loading, and module resolution. Understanding both layers is the first step toward a production-quality deployment.
+
+## `.env` Files
+
+Backtest Kit uses [dotenv](https://github.com/motdotla/dotenv) to load environment variables before any strategy code runs. The CLI loads two `.env` files in a specific order, with the strategy-level file taking precedence:
+
+1. **Project root** — the `.env` in the directory where you ran `npx @backtest-kit/cli`. Shared API keys and infrastructure credentials belong here.
+2. **Strategy directory** — the `.env` placed next to your strategy entry point. Any variable defined here overrides the same variable from the root file.
+
+This two-level cascade lets a monorepo share Telegram and exchange credentials at the root while allowing individual strategies to override, for example, which MongoDB database they write to.
+
+```text
+monorepo/
+├── .env                          ← loaded first (shared credentials)
+└── strategies/
+    └── oct_2025/
+        ├── index.ts              ← strategy entry point
+        └── .env                  ← loaded second (overrides root)
+```
+
+<Note>
+  The strategy-level `.env` is only loaded when the CLI changes its working directory to the strategy folder — this happens automatically for all execution modes (`--backtest`, `--live`, `--paper`, `--walker`).
+</Note>
+
+## Environment Variables Reference
+
+All environment variables recognized by Backtest Kit and `@backtest-kit/cli` are listed in the table below. None are required for a basic backtest; the framework falls back to sensible defaults when they are absent.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CC_TELEGRAM_TOKEN` | — | Telegram bot token obtained from [@BotFather](https://t.me/BotFather). Required when you pass `--telegram`. |
+| `CC_TELEGRAM_CHANNEL` | — | Telegram channel or chat ID (e.g. `-100123456789`). Required when you pass `--telegram`. |
+| `CC_WWWROOT_HOST` | `0.0.0.0` | Bind address for the web dashboard server. Change to `127.0.0.1` to restrict access to localhost. |
+| `CC_WWWROOT_PORT` | `60050` | Port the web dashboard listens on. Override if the default conflicts with another service. |
+| `CC_QUICKCHART_HOST` | — | URL of a self-hosted [QuickChart](https://quickchart.io/) instance. When empty, the public QuickChart API is used to generate price-chart images for Telegram messages. |
+| `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-kit?wtimeoutMS=15000` | MongoDB connection string used by `@backtest-kit/mongo`. |
+| `CC_REDIS_HOST` | `127.0.0.1` | Hostname of the Redis server used by `@backtest-kit/mongo`. |
+| `CC_REDIS_PORT` | `6379` | Port of the Redis server. |
+| `CC_REDIS_USER` | _(empty)_ | Redis username (leave empty for Redis instances without ACL). |
+| `CC_REDIS_PASSWORD` | _(empty)_ | Redis password. |
+
+<Tip>
+  Exchange API keys (for CCXT) are not framework-level variables. You read them from `process.env` inside your own `addExchangeSchema` call — typically `process.env.BINANCE_API_KEY` — and pass them to the CCXT constructor. This keeps credential naming entirely under your control.
+</Tip>
+
+## `config/setup.config`
+
+The setup config is loaded **once**, before any module hooks or strategy code run. Its purpose is one-time initialization that must complete before the first persistence call — most commonly, swapping the default file-based storage for a production-grade backend.
+
+When `setup.config` is present, the CLI surrenders full ownership of the persistence layer to you: it does **not** call `usePersist()`, `useLocal()`, or `useMemory()` for any of the 15 persistence slots. Whatever adapters you register inside `setup.config` are the ones the framework uses.
+
+The most common use case is registering `@backtest-kit/mongo`:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup();
+```
+
+With connection environment variables defined in `.env`, that single call wires up all 15 persistence adapters. You can also pass parameters explicitly if you prefer not to use environment variables:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup({
+  CC_MONGO_CONNECTION_STRING: 'mongodb://mongo:27017/mydb',
+  CC_REDIS_HOST: 'redis',
+  CC_REDIS_PORT: 6379,
+  CC_REDIS_PASSWORD: 'secret',
+});
+```
+
+<Warning>
+  `setup.config` is loaded for its **side effects only** — the CLI does not await a return value. All initialization inside `setup.config` must be synchronous. Use `loader.config` (described below) for async work like opening a database connection.
+</Warning>
+
+## `config/loader.config`
+
+The loader config is executed **after** `setup.config` but **before** any strategy or module code runs. Unlike `setup.config`, the CLI explicitly `await`s the function exported by `loader.config`. Use it whenever a dependency must be fully ready before the backtest begins.
+
+Two export styles are supported (never both at once — `default` wins if both are present):
+
+```typescript
+// config/loader.config.ts — preferred ESM style
+export default async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+  console.log('MongoDB connection verified, starting backtest');
+};
+```
+
+```typescript
+// config/loader.config.ts — named export
+export const loader = async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+};
+```
+
+Common reasons to use `loader.config`:
+
+- **Verify a database connection** — confirm MongoDB or Redis is reachable before the first tick so the run fails immediately rather than mid-backtest.
+- **Warm up reference data** — pre-fetch instruments lists, funding-rate tables, or fee schedules so the first signal tick doesn't pay the round-trip cost.
+- **Run schema migrations** — apply pending migrations to the persistence backend before signals start flowing.
+- **Wire monorepo packages** — import sibling workspaces that register shared broker adapters or signal feeds.
+
+Here is a complete pattern that combines both config files:
+
+```typescript
+// config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+// Registers all 15 adapters synchronously.
+setup();
+```
+
+```typescript
+// config/loader.config.ts
+import mongoose from 'mongoose';
+
+// Blocks the CLI until the connection is open.
+export default async () => {
+  await mongoose.connect(process.env.CC_MONGO_CONNECTION_STRING!);
+  console.log('Mongo connection verified, starting backtest');
+};
+```
+
+## `config/alias.config`
+
+The alias config lets you intercept `require()` / `import` calls at the Node.js module loader level and substitute a different module — without touching strategy code. The CLI loads the alias table once, before the first strategy import.
+
+Typical use cases include replacing a heavy CCXT dependency with a lightweight stub during CI runs or resolving ESM-only packages that `require()` cannot natively handle:
+
+```typescript
+// config/alias.config.ts — static mapping
+export const ccxt = require('./stubs/ccxt.stub.cjs');
+```
+
+```typescript
+// config/alias.config.ts — async factory for ESM-only packages
+export default async () => ({
+  // nanoid is ESM-only; alias it so strategy code can still call require('nanoid')
+  nanoid: await import('nanoid'),
+  'p-limit': await import('p-limit'),
+});
+```
+
+<Note>
+  Aliases apply **process-wide** — every module loaded in the current Node.js process is affected. There is no per-strategy alias scope.
+</Note>
+
+## `config/symbol.config`
+
+The symbol config controls the list of trading pairs shown in the web dashboard. When absent, the UI requests all symbols from the registered exchange. Override it to restrict the list, control display order, or add asset metadata such as icons and colors:
+
+```typescript
+// config/symbol.config.ts
+export const symbol_list = [
+  {
+    icon: '/icon/btc.png',
+    logo: '/icon/128/btc.png',
+    symbol: 'BTCUSDT',
+    displayName: 'Bitcoin',
+    color: '#F7931A',
+    priority: 50,
+    description: 'Bitcoin — the first and most popular cryptocurrency',
+  },
+  {
+    icon: '/icon/eth.png',
+    logo: '/icon/128/eth.png',
+    symbol: 'ETHUSDT',
+    displayName: 'Ethereum',
+    color: '#6F42C1',
+    priority: 50,
+    description: 'Ethereum — a blockchain platform for smart contracts',
+  },
+];
+```
+
+The CLI resolves `symbol.config` using the following priority order (first match wins):
+
+1. `{strategyDir}/config/symbol.config` — per-strategy override
+2. `{projectRoot}/config/symbol.config` — project-wide override
+3. Built-in default shipped with `@backtest-kit/cli`
+
+## `config/notification.config`
+
+The notification config controls which event categories appear in the web dashboard's notification feed. All categories are enabled by default except `partial_loss`, `partial_profit`, and `signal_sync`, which are disabled to reduce noise during normal operation.
+
+```typescript
+// config/notification.config.ts
+export default {
+  signal: true,           // Signal lifecycle: opened, scheduled, closed, cancelled
+  risk: true,             // Risk manager rejection notifications
+  info: true,             // Informational messages attached to an active signal
+  breakeven: true,        // Breakeven level reached
+  common_error: true,     // Non-fatal runtime errors
+  critical_error: true,   // Fatal errors that terminate the session
+  validation_error: true, // Strategy config / input validation errors
+  strategy_commit: true,  // All committed actions (partial close, DCA, trailing, etc.)
+  partial_loss: false,    // Partial loss level reached (before commit)
+  partial_profit: false,  // Partial profit level reached (before commit)
+  signal_sync: false,     // Live order fill / exit confirmations from exchange sync
+};
+```
+
+The same resolution order applies: strategy directory → project root → package default.
+
+## `config/telegram.config`
+
+By default, Telegram messages are rendered from Mustache templates located in your `template/` directory. The `telegram.config` file lets you replace any or all of those templates with a programmatic function that receives the event payload and returns a `Promise<string>`.
+
+All methods are optional — unimplemented ones fall back to their Mustache template automatically:
+
+```typescript
+// config/telegram.config.ts
+import {
+  IStrategyTickResultOpened,
+  IStrategyTickResultClosed,
+  RiskContract,
+} from 'backtest-kit';
+
+export default {
+  async getOpenedMarkdown(event: IStrategyTickResultOpened): Promise<string> {
+    return `**Opened** ${event.symbol} @ ${event.priceOpen}`;
+  },
+  async getClosedMarkdown(event: IStrategyTickResultClosed): Promise<string> {
+    return `**Closed** ${event.symbol} @ ${event.priceClosed}`;
+  },
+  async getRiskMarkdown(event: RiskContract): Promise<string> {
+    return `**Risk rejected** ${event.symbol}: ${event.reason}`;
+  },
+};
+```
+
+## Default Behaviors
+
+When you run a backtest without registering an exchange, frame, or strategy, the CLI falls back to built-in defaults and prints a console warning for each one:
+
+| Component | Default | Notes |
+| --- | --- | --- |
+| Exchange | CCXT Binance (`default_exchange`) | Does **not** support order book fetching in backtest mode — register a custom exchange schema if your strategy calls `getOrderBook()`. |
+| Frame | February 2024 (`default_frame`) | One calendar month of 1-minute candles on BTCUSDT. |
+| Symbol | `BTCUSDT` | Override with `--symbol` on the command line. |
+| Cache intervals | `1m, 15m, 30m, 4h` | Pre-cached before each backtest run; skip with `--noCache`. |

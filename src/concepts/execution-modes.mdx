@@ -1,0 +1,240 @@
+---
+title: "Execution Modes: Backtest, Paper, and Live Trading"
+sidebarTitle: "Execution Modes"
+description: "Learn how Backtest Kit's unified execution engine runs the same strategy code in backtest, paper trading, and live trading modes without modification."
+---
+
+One of the core promises of Backtest Kit is that you write your strategy code once and deploy it in any context — historical simulation, paper trading against live prices, or real exchange trading — without changing a single line. This is not a post-hoc compatibility layer; it is baked into the architecture through an ambient execution context that every framework function reads automatically. The result is that the gap between a validated backtest and a deployed live bot is a configuration change, not a code rewrite.
+
+## The Three Modes
+
+### Backtest — Historical Simulation
+
+In backtest mode, the engine iterates over a pre-defined time range, feeding each interval to your strategy as if the clock were advancing naturally. The exchange adapter returns historical candle data aligned to interval boundaries, and every data access is gated against the current simulation timestamp so you cannot accidentally request data that did not yet exist.
+
+Backtest mode is your primary research and validation environment. Every strategy decision is made with the same code path that runs in live mode, so a bug caught in backtest is a bug caught before it can affect real capital.
+
+### Paper — Live Prices, No Orders
+
+Paper trading connects to the live exchange for real-time price feeds but sends no actual orders to the broker adapter. It is the safest way to verify that your strategy behaves as expected on live data before committing real funds. Because the execution engine is identical, any timing or state issue that appears in paper mode will also appear in live mode — and conversely, a strategy that works cleanly in paper mode will work cleanly live.
+
+### Live — Real Trading
+
+Live mode is identical to paper mode except that the broker adapter is active and committed orders are sent to the exchange. Crash-safe persistence ensures that if the process restarts mid-trade, it recovers to the last atomically-saved state and resumes monitoring the open position. Graceful shutdown waits for any open positions to close before the process exits, preventing orphaned trades.
+
+## Ambient Temporal Context with AsyncLocalStorage
+
+The reason the same strategy code works in all three modes is that Backtest Kit never asks you to pass a timestamp parameter. Instead, every call you make inside a strategy tick runs inside a Node.js `AsyncLocalStorage` scope that was populated by the execution engine before invoking your handler.
+
+When you call `getCandles`, `getAveragePrice`, or `getDate` from anywhere in your strategy — including deeply nested utility functions — the framework intercepts the request and injects the current execution timestamp. In backtest mode that timestamp is the candle time. In live mode it is `new Date()`. Your code sees neither the plumbing nor the mode; it just asks for data and receives the temporally correct answer.
+
+```text
+Execution context: { symbol, when, backtest: true }
+  └─► your strategy tick fires
+        └─► getCandles("BTCUSDT", "1h", 50)
+              └─► exchange adapter reads execution context → "when" = 2024-03-15T08:00:00Z
+                    └─► returns only candles with timestamp ≤ 2024-03-15T08:00:00Z
+```
+
+This design makes look-ahead bias structurally impossible: the adapter physically cannot return a candle whose timestamp is after "now."
+
+<Note>
+  The execution context also carries the `strategyName`, `exchangeName`, `frameName`, and `backtest` flag, so helper functions like `getMode()` and `getRuntimeInfo()` work correctly regardless of where they are called in your call stack.
+</Note>
+
+## Running a Backtest
+
+### `Backtest.run()` — Sequential, Single Symbol
+
+`Backtest.run(symbol, context)` drives one symbol to completion and returns the final closed-signal result. Use it when you need the return value inline or are running a simple sequential script.
+
+### `Backtest.background()` — Concurrent, Fire-and-Forget
+
+`Backtest.background(symbol, context)` starts the backtest in the background and immediately returns. Results arrive through event listeners (`listenSignal`, `listenSignalBacktest`, `listenDone`). This is the correct choice for running multiple symbols in parallel — all background backtests share the same V8 event loop, MongoDB connection pool, and Redis cache.
+
+The engine uses a cooperative yield mechanism so that parallel backtests hand off the event loop in round-robin fashion rather than letting the first-started symbol monopolize the CPU.
+
+**Performance reference (commodity laptop, i5-13420H, 9 symbols):**
+
+| Metric | Value |
+| --- | --- |
+| Aggregate replay speed | ~6,300× real time |
+| Per-symbol replay speed | ~703× real time |
+| Hot-loop throughput | ~103 events/second |
+
+## Configuring the Backtest Frame
+
+Before calling `Backtest.background()`, register a `FrameSchema` that defines the date range and candle interval for the simulation. `addFrameSchema` accepts `startDate`, `endDate`, and `interval`, along with an optional `onTimeframe` callback that fires when the timeframe array is generated — useful for logging the simulation window before it starts.
+
+```typescript
+import {
+  addExchangeSchema,
+  addStrategySchema,
+  addFrameSchema,
+  addRiskSchema,
+  Backtest,
+  listenSignal,
+  listenSignalBacktest,
+  listenDone,
+  listenError,
+  Log,
+  Position,
+  commitAverageBuy,
+  commitClosePending,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+} from "backtest-kit";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+// 1. Register the exchange data source
+addExchangeSchema({
+  exchangeName: "binance_spot",
+  getCandles: async ({ symbol, interval, limit }) => {
+    // Your candle-fetching implementation
+    return fetchCandlesFromBinance(symbol, interval, limit);
+  },
+  formatPrice: (symbol, price) => Number(price.toFixed(2)),
+  formatQuantity: (symbol, qty) => Number(qty.toFixed(6)),
+});
+
+// 2. Define the backtest window and interval
+addFrameSchema({
+  frameName: "q1_2026",
+  startDate: new Date("2026-01-01"),
+  endDate: new Date("2026-04-01"),
+  interval: "1h",
+  callbacks: {
+    onTimeframe: (timeframes, startDate, endDate, interval) => {
+      console.log(`Generated ${timeframes.length} timeframes at ${interval}`);
+    },
+  },
+});
+
+// 3. Register the strategy
+addStrategySchema({
+  strategyName: "dca_long",
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: "long",
+      ...Position.moonbag({
+        position: "long",
+        currentPrice,
+        percentStopLoss: 25,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: 100,
+    };
+  },
+});
+
+// 4. Observe results as they stream in (fires for both backtest and live)
+listenSignal((result) => {
+  if (result.action === "closed") {
+    Log.info("signal closed", {
+      symbol: result.symbol,
+      pnl: result.pnl,
+      closeReason: result.closeReason,
+    });
+  }
+});
+
+// 5. Observe backtest-only results
+listenSignalBacktest((result) => {
+  if (result.action === "active") {
+    Log.info("backtest tick active", { symbol: result.symbol, pnl: result.pnl });
+  }
+});
+
+// 6. Handle errors without crashing
+listenError((error) => {
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+
+// 7. Know when each symbol finishes (backtest flag distinguishes mode)
+listenDone(({ symbol, strategyName, backtest }) => {
+  console.log(`Run complete: ${strategyName} on ${symbol} (backtest=${backtest})`);
+});
+
+// 8. Start the backtest for multiple symbols concurrently
+const context = {
+  strategyName: "dca_long",
+  exchangeName: "binance_spot",
+  frameName: "q1_2026",
+};
+
+await Backtest.background("BTCUSDT", context);
+await Backtest.background("ETHUSDT", context);
+await Backtest.background("SOLUSDT", context);
+```
+
+<Tip>
+  Call `warmCandles({ symbol, exchangeName, interval, startDate, endDate })` before starting backtests on large date ranges. This pre-downloads and caches all candle data so the backtest engine never stalls on network I/O mid-simulation.
+</Tip>
+
+## Running Live and Paper Trading
+
+### `Live.run()` — Blocking, Single Symbol
+
+`Live.run(symbol, context)` runs a live loop synchronously and resolves only when the strategy is stopped. It is rarely used directly; prefer `Live.background()` for production deployments.
+
+### `Live.background()` — Non-blocking, Production-Ready
+
+`Live.background(symbol, context)` starts an infinite tick loop in the background. Between ticks the engine sleeps for a configurable `TICK_TTL` interval, then calls `getAveragePrice` (VWAP from the last 5 one-minute candles) and evaluates the strategy. State is written atomically to the persistence adapter after every mutation.
+
+**Graceful shutdown** is built in: when `SIGINT` or `stopStrategy(symbol)` is received, the engine waits for the current tick to finish and, if a position is open, continues ticking until that position closes before exiting. No orphaned positions.
+
+**Crash recovery**: on restart, the framework reads the last persisted signal state from disk. If a position was open when the process died, the engine resumes monitoring it on the next tick as if nothing happened.
+
+```typescript
+import { Live, listenSignalLive, listenError, listenDone } from "backtest-kit";
+
+// listenSignalLive fires only during Live.background() / Live.run()
+listenSignalLive((result) => {
+  console.log(`[LIVE] ${result.symbol} → ${result.action}`);
+});
+
+listenError((error) => {
+  console.error("Live error:", error.message);
+});
+
+// listenDone fires when Live.background() finishes (backtest: false)
+listenDone(({ symbol, backtest }) => {
+  console.log(`Live session ended for ${symbol} (backtest=${backtest})`);
+});
+
+await Live.background("BTCUSDT", {
+  strategyName: "dca_long",
+  exchangeName: "binance_spot",
+  // No frameName — live mode does not use a frame schema
+});
+```
+
+<Warning>
+  Always attach a `listenError` handler before starting `Live.background()`. Errors inside background loops are surfaced through the error emitter rather than thrown synchronously, so without a listener they are silently swallowed.
+</Warning>
+
+## Switching Between Modes
+
+Switching from backtest to paper or live requires no strategy code changes. The only difference is which top-level runner you call and whether a `frameName` is provided:
+
+| Mode | Runner | `frameName` required? | Orders sent? |
+| --- | --- | --- | --- |
+| Backtest | `Backtest.background()` / `Backtest.run()` | ✅ Yes | ❌ No |
+| Paper | `Live.background()` / `Live.run()` | ❌ No | ❌ No |
+| Live | `Live.background()` / `Live.run()` | ❌ No | ✅ Yes |
+
+The `getMode()` helper returns `"backtest"` or `"live"` from inside any strategy function if you need to branch behavior (for example, to suppress expensive API calls during simulation):
+
+```typescript
+import { getMode } from "backtest-kit";
+
+const mode = await getMode();
+if (mode === "live") {
+  // Fetch real-time sentiment data only during live runs
+  const sentiment = await fetchNewsSentiment();
+}
+```

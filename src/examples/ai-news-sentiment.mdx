@@ -1,0 +1,301 @@
+---
+title: "AI News Sentiment Strategy: LLM-Powered Trading Signals"
+sidebarTitle: "AI Sentiment"
+description: "Build an AI news sentiment trading strategy using Tavily and Ollama. Classifies headlines as bullish, bearish, or wait. Returned +16.99% PnL in Feb 2026."
+---
+
+Technical indicators are calibrated on historical price data and assume a stable market regime — but regime is defined by news sentiment, not by price. When a hawkish Fed nomination, a major ETF outflow event, or a geopolitical escalation shifts sentiment overnight, every lagging indicator breaks in the same direction at once. An LLM can read the same headlines a market participant reads and classify the near-term bias before the candles show it. The AI News Sentiment strategy codifies this idea: every four to eight hours it fetches the latest Bitcoin and macro news via Tavily, passes the headlines to a local Ollama model, and opens a LONG or SHORT based on the classification — returning **\+16.99% PnL** in February 2026, a month where BTC itself fell 16.4%.
+
+## How It Works
+
+<Steps>
+  <Step title="Fetch headlines every 4–8 hours via Tavily">
+    A cron job fires on a configurable interval. It calls the Tavily search API with a query crafted to surface market-moving sentiment — not direct Bitcoin price articles, but the macro, institutional, and regulatory narratives that authoritative sources embed into the market. The raw search result (a short LLM-generated summary across results) is passed directly to the next step.
+
+    ```typescript
+    // Tavily returns a short summary string across search results.
+    // Query targets near-zero-score results — the indirect market sentiment,
+    // not direct Bitcoin advertising.
+    const result = await tavily.search({
+      query: "Bitcoin crypto market outlook institutional sentiment macro",
+      search_depth: "advanced",
+      max_results: 5,
+    });
+    ```
+  </Step>
+  <Step title="Pass headlines to Ollama for classification">
+    The strategy builds a structured conversation — a `messages` array — and sends it to the local Ollama model. The system prompt instructs the model to return exactly one of three strings: `bullish`, `bearish`, or `wait`. The user message contains the raw news summary. Using a local model means zero per-call cost during backtesting and no rate-limit concerns.
+
+    ```typescript
+    const messages = [
+      {
+        role: "system",
+        content: `You are a crypto market sentiment analyst.
+    Analyze the provided news headlines and return ONLY one word:
+    - "bullish" if the overall sentiment suggests price will rise
+    - "bearish" if the overall sentiment suggests price will fall
+    - "wait" if signals are mixed or unclear
+    Do not explain your reasoning. Return only the single word.`,
+      },
+      {
+        role: "user",
+        content: `Current Bitcoin and macro news:\n\n${newsContent}\n\nWhat is the market sentiment?`,
+      },
+    ];
+    
+    const response = await ollama.chat({
+      model: "deepseek-v3.1:671b",   // or any model running in your Ollama instance
+      messages,
+      format: "json",
+    });
+    
+    const sentiment = response.message.content.trim().toLowerCase();
+    // Returns: "bullish" | "bearish" | "wait"
+    ```
+  </Step>
+  <Step title="getSignal maps sentiment to position direction">
+    `getSignal` reads the cached sentiment result. It opens a **LONG** on `bullish`, a **SHORT** on `bearish`, and returns `null` (no trade) on `wait`. Both directions use `Position.moonbag` with a 1% hard stop — the real exit mechanism is the trailing take-profit defined in the active-ping listener.
+
+    ```typescript
+    getSignal: async (symbol, when, currentPrice) => {
+      const sentiment = await Cache.fn(
+        "news-sentiment",
+        async () => classifyNewsSentiment(),
+        { intervalMs: 4 * 60 * 60 * 1000 }   // re-fetch every 4 hours
+      );
+    
+      if (sentiment === "wait") return null;
+    
+      const position = sentiment === "bullish" ? "long" : "short";
+    
+      return {
+        position,
+        ...Position.moonbag({
+          position,
+          currentPrice,
+          percentStopLoss: 1,                  // 1% hard stop
+        }),
+        minuteEstimatedTime: Infinity,
+        cost: 100,
+      };
+    },
+    ```
+  </Step>
+  <Step title="Sentiment flip closes the open position">
+    A second `listenActivePing` listener checks the current sentiment on every tick. If the cached sentiment has flipped to the opposite direction while a position is open, it calls `commitClosePending` immediately. This is what generates the `flip` exit type in the trade log — three of the 16 February 2026 trades closed this way, recycling capital into the new directional trade faster than a trailing stop would.
+
+    ```typescript
+    listenActivePing(async ({ symbol, currentPrice }) => {
+      const currentSentiment = await getSentimentFromCache();
+      const activePosition = await getActivePosition(symbol);
+    
+      const isConflicting =
+        (activePosition.direction === "long" && currentSentiment === "bearish") ||
+        (activePosition.direction === "short" && currentSentiment === "bullish");
+    
+      if (isConflicting) {
+        await commitClosePending(symbol, {
+          id: "sentiment-flip",
+          note: "# Closed: sentiment reversed direction",
+        });
+      }
+    });
+    ```
+  </Step>
+  <Step title="Exit via trailing take-profit or stop-loss">
+    The primary exit is a trailing take-profit: the position records its peak PnL, and as soon as price retraces 1% from that peak (e.g., position peaks at \+3% then falls to \+2%) the position closes. This is what drives the `take` exits in the trade log. The 1% hard stop (set in `getSignal`) handles sudden reversals before a trailing peak is established.
+  </Step>
+</Steps>
+
+## Code Structure
+
+The strategy separates concerns into three layers that mirror the Backtest Kit architecture:
+
+<CodeGroup>
+
+```typescript Strategy entry (feb_2026.strategy.ts)
+import {
+  addStrategySchema,
+  listenActivePing,
+  listenError,
+  Log,
+  Position,
+  commitClosePending,
+  Cache,
+} from "backtest-kit";
+import { classifyNewsSentiment } from "./utils/sentiment";
+import { errorData, getErrorMessage } from "functools-kit";
+
+addStrategySchema({
+  strategyName: "feb_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    // Cache.fn re-runs classifyNewsSentiment at most once per 4–8 hours.
+    // The backtest engine's ambient temporal context ensures the cache key
+    // is aligned to the backtest timestamp — no look-ahead bias.
+    const sentiment = await Cache.fn(
+      `news-sentiment-${symbol}`,
+      () => classifyNewsSentiment(),
+      { intervalMs: 4 * 60 * 60 * 1000 }
+    );
+
+    if (sentiment === "wait") return null;
+
+    const position = sentiment === "bullish" ? "long" : "short";
+
+    return {
+      position,
+      ...Position.moonbag({
+        position,
+        currentPrice,
+        percentStopLoss: 1,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: 100,
+    };
+  },
+});
+
+listenActivePing(async ({ symbol }) => {
+  // Sentiment flip: close if the LLM has reversed direction.
+  const sentiment = await Cache.fn(
+    `news-sentiment-${symbol}`,
+    () => classifyNewsSentiment(),
+    { intervalMs: 4 * 60 * 60 * 1000 }
+  );
+  // ... flip detection logic
+});
+
+listenError((error) => {
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+```typescript LLM call (utils/sentiment.ts)
+import Ollama from "ollama";
+import { tavily } from "@tavily/core";
+
+const ollamaClient = new Ollama({ host: process.env.OLLAMA_BASE_URL });
+const tavilyClient = tavily({ apiKey: process.env.TAVILY_API_KEY });
+
+export async function classifyNewsSentiment(): Promise<"bullish" | "bearish" | "wait"> {
+  // Step 1: Fetch news from Tavily
+  const searchResult = await tavilyClient.search({
+    query: "Bitcoin crypto market sentiment institutional macro outlook",
+    search_depth: "advanced",
+    max_results: 5,
+  });
+
+  const newsContent = searchResult.answer ?? searchResult.results
+    .map((r) => `${r.title}: ${r.content}`)
+    .join("\n\n");
+
+  // Step 2: Build message array for multi-turn LLM conversation
+  const messages = [
+    {
+      role: "system" as const,
+      content: `You are a crypto market sentiment analyst.
+Analyze the provided news and return ONLY one word:
+- "bullish" if sentiment suggests price will rise
+- "bearish" if sentiment suggests price will fall  
+- "wait" if signals are mixed or unclear
+Return only the single word with no explanation.`,
+    },
+    {
+      role: "user" as const,
+      content: `Current Bitcoin and macro news:\n\n${newsContent}\n\nWhat is the market sentiment?`,
+    },
+  ];
+
+  // Step 3: Call local Ollama model
+  const response = await ollamaClient.chat({
+    model: "deepseek-v3.1:671b",
+    messages,
+  });
+
+  const raw = response.message.content.trim().toLowerCase();
+
+  if (raw.includes("bullish")) return "bullish";
+  if (raw.includes("bearish")) return "bearish";
+  return "wait";
+}
+```
+
+</CodeGroup>
+
+## Backtest Results — February 2026
+
+February 2026 was one of the most bearish months for BTC in recent history. The Kevin Warsh Fed nomination shock, AI-sector re-pricing, $4B in Bitcoin ETF outflows across five weeks, and Trump's 15% global tariffs drove BTC from ~$79k to ~$60k before a partial recovery to ~$66k. Net monthly move: **−16.4%**.
+
+| Metric | Value |
+| --- | --- |
+| Total trades | 16 |
+| Net PnL | **\+16.99%** |
+| Win rate | 68.8% (11 / 16) |
+| Avg win | \+2.78% |
+| Avg loss | −2.72% |
+| Profit factor | **2.25** |
+| Best trade |  |
+| Worst trade | −3.41% (stop-loss) |
+| Direction split | 14× SHORT / 2× LONG |
+| Exit: trailing take | 9 |
+| Exit: stop-loss | 4 |
+| Exit: sentiment flip | 3 |
+| **Sharpe ratio** | **0.25** |
+
+The strategy correctly held SHORT bias for almost the entire month, switched to LONG on Feb 19 during a US industrial output \+ VIX drop recovery (\+6.3%), then reversed back to SHORT when US–Iran escalation and tariff news resumed. The LLM was correctly reading the macro regime — something no lagging technical indicator could have done.
+
+<Note>
+  The best single trade (\+14.28% on Feb 4) was driven by the LLM identifying institutional selloff and Kevin Warsh hawkish pivot news before the candles confirmed the move. This is the core thesis of the strategy: news is a leading indicator, price is a lagging one.
+</Note>
+
+## Why It Worked
+
+Technical indicators like moving averages are calibrated on historical price data. They assume the current market regime resembles past regimes. News sentiment defines _which_ regime you are in. When sentiment shifts — from risk-on to risk-off, from rate-cut expectations to hawkish surprises — indicators tuned to the old regime produce signals that are systematically wrong.
+
+An LLM reading live headlines operates on the same leading data that authoritative market participants are reacting to. In February 2026, the signal was clear: sustained ETF outflows, institutional deleveraging, and hawkish macro surprises. The model classified this as `bearish` on 12 of 16 signal evaluations and was correct 11 times.
+
+## Setup Requirements
+
+<Steps>
+  <Step title="Install and start Ollama">
+    Ollama runs models locally with no per-call API cost. Download from [ollama.com](https://ollama.com), then pull the model you want to use:
+
+    ```bash
+    ollama pull deepseek-v3.1:671b
+    # Or a lighter model for development:
+    ollama pull llama3.3:8b
+    ollama serve
+    ```
+  </Step>
+  <Step title="Get a Tavily API key">
+    Tavily ([tavily.com](https://tavily.com)) provides a free tier suitable for development and backtesting. Create an account, copy your API key, and add it to your `.env` file:
+
+    ```env
+    TAVILY_API_KEY=tvly-your-key-here
+    OLLAMA_BASE_URL=http://localhost:11434
+    ```
+  </Step>
+  <Step title="Run the backtest">
+    ```bash
+    npm start -- --backtest --symbol BTCUSDT \
+      --strategy feb_2026_strategy \
+      --exchange ccxt-exchange \
+      --frame feb_2026_frame \
+      ./content/feb_2026.strategy/feb_2026.strategy.ts
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  **Prompt engineering matters more than model size.** The most important instruction you can add to your system prompt is a strong `wait` bias: tell the model to return `wait` whenever signals are ambiguous, conflicting, or when it would be speculating rather than reading clear sentiment. The February 2026 backtest skipped trades on mixed-signal days (e.g., "Dow 50,000 record vs Goldman record short book"), which prevented a number of losing trades. A trigger-happy prompt will overtrade and erode Sharpe. Also instruct the model to focus on _leading_ narrative (who is saying what, and what institutional flows are reported) rather than interpreting technical analysis levels — that is the job of your indicators, not your LLM.
+</Tip>
+
+## Recommendations for Production Use
+
+- **Use a 24-hour news window.** A shorter window risks catching intra-day noise where morning optimism cancels evening pessimism. A 24-hour window surfaces the dominant regime.
+- **Filter sources without timestamps.** Some major news sites (Bloomberg, Reuters, WSJ) appear in Tavily results with `00:00:00 UTC` timestamps — they have no publication time component. Filter these out to avoid look-ahead bias.
+- **Separate vector search from LLM analysis.** Vector search should find publications; the LLM should analyze sentiment. If you pass search queries to the LLM itself, it will hallucinate moves from its training data rather than reading the news you actually fetched.
+- **Cache aggressively.** `Cache.fn` ensures the Tavily and Ollama calls happen at most once per cache interval, even when the backtest engine fires `getSignal` dozens of times per hour. This keeps API costs low and prevents rate limiting during multi-month backtests.

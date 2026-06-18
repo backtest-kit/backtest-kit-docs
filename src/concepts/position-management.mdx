@@ -1,0 +1,268 @@
+---
+title: "Position Management: DCA, Partial Closes, and Trailing Exits"
+sidebarTitle: "Position Management"
+description: "Learn Backtest Kit's position management features: Dollar-Cost Averaging, partial profit and loss closes, trailing stops, and breakeven protection."
+---
+
+Once a position is open, the real work of a trading strategy begins. Static all-or-nothing entries and exits miss the mechanics that separate robust systematic strategies from simple crossover scripts. Backtest Kit treats position management as a first-class concern, providing mathematically accurate tools for dollar-cost averaging, partial profit and loss closes, trailing exits, and breakeven protection — all with full cost-basis tracking and overlap detection built in.
+
+## Dollar-Cost Averaging with `commitAverageBuy`
+
+Dollar-cost averaging (DCA) means adding to an existing position at progressively better prices to lower your blended entry. In practice this requires careful bookkeeping: every new entry must be recorded with its price, cost, and timestamp; the effective average price must recalculate after each entry; and partial closes must adjust the cost basis proportionally.
+
+`commitAverageBuy(symbol, cost?)` does all of this automatically. Each call records a new entry at the current VWAP price, recalculates the position's **harmonic mean** effective entry price, and emits an `AverageBuyCommitNotification` with the updated average. The framework physically rejects any call that would worsen your effective entry — it will not let you average into a profitable position.
+
+### Reading DCA State
+
+| Function | Returns |
+| --- | --- |
+| `getPositionEntries(symbol)` | Array of `{ price, cost }` for every entry including the original |
+| `getPositionEffectivePrice(symbol)` | Harmonic-mean blended entry price |
+| `getPositionInvestedCount(symbol)` | Number of DCA entries made (1 = original only) |
+| `getPositionInvestedCost(symbol)` | Total capital deployed across all entries |
+| `getPositionLevels(symbol)` | Array of just the entry prices in order |
+
+### Overlap Detection
+
+Before placing a new DCA rung you should check whether the current price is already within the band of an existing entry. `getPositionEntryOverlap(symbol, currentPrice, ladder?)` returns `true` if `currentPrice` falls inside the `upperPercent` / `lowerPercent` tolerance window around any existing entry level. This prevents stacking multiple rungs at nearly identical prices when the market oscillates.
+
+```typescript
+const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+  upperPercent: 5,   // don't add if price is within 5% above an existing entry
+  lowerPercent: 1,   // don't add if price is within 1% below an existing entry
+});
+```
+
+## Partial Profit Closes with `commitPartialProfit`
+
+`commitPartialProfit(symbol, percentToClose)` closes a specified percentage of the current position when the price is moving toward the take-profit level. This lets you lock in gains at milestone levels while keeping exposure to further upside.
+
+Each partial close is recorded in the `_partial` history with the type (`profit`), percentage, execution price, and cost basis at the time. Subsequent DCA entries blend with the adjusted cost basis from prior partials, keeping the effective price calculation accurate throughout the trade's lifetime.
+
+```typescript
+// Close 25% of the position at current market price (moving toward TP)
+await commitPartialProfit(symbol, 25);
+```
+
+To close a specific dollar amount instead of a percentage, use `commitPartialProfitCost(symbol, dollarAmount)`, which calculates the equivalent percentage automatically.
+
+### Preventing Duplicate Partials
+
+Use `getPositionPartialOverlap(symbol, currentPrice, ladder?)` before triggering a partial close to check whether you have already executed a partial at a nearby price level. The function applies the same `upperPercent` / `lowerPercent` tolerance window logic as `getPositionEntryOverlap`.
+
+## Partial Loss Closes with `commitPartialLoss`
+
+`commitPartialLoss(symbol, percentToClose)` works identically to `commitPartialProfit` but is triggered when price is moving toward the stop-loss level. Use it to systematically reduce exposure as a trade moves against you, rather than waiting for the full stop to hit.
+
+```typescript
+// Reduce exposure by 50% as the trade approaches SL
+await commitPartialLoss(symbol, 50);
+```
+
+`commitPartialLossCost(symbol, dollarAmount)` provides the same dollar-amount shortcut as its profit counterpart.
+
+<Note>
+  Both partial-close functions check that the price is moving in the correct direction before executing. `commitPartialProfit` only fires if price is trending toward TP; `commitPartialLoss` only fires toward SL. This prevents accidental partial closes triggered in the wrong market direction.
+</Note>
+
+## Trailing Stop with `commitTrailingStop`
+
+`commitTrailingStop(symbol, percentShift, currentPrice)` adjusts the stop-loss level relative to the **original** SL distance, not the current trailing SL. This prevents small floating-point rounding errors from compounding over hundreds of ticks.
+
+- A **negative** `percentShift` brings the SL closer to entry (tightens it — increases protection).
+- A **positive** `percentShift` moves the SL further from entry (loosens it — gives the position more room).
+
+Crucially, the adjustment is **absorbed** only if it improves protection. For a long position the SL can only move up; for a short position it can only move down. Attempting to move the SL backward (against the direction of protection) is silently ignored.
+
+```typescript
+// Tighten stop by 2% on each favorable tick
+await commitTrailingStop(symbol, -2, currentPrice);
+```
+
+To set the trailing SL to a specific price rather than a relative percentage, use `commitTrailingStopCost(symbol, stopLossPrice)`.
+
+<Tip>
+  Because `commitTrailingStop` bases its calculation on the original SL distance, you can call it on every tick inside `listenActivePing` without accumulating drift. The math resets to the original reference point each time.
+</Tip>
+
+## Trailing Take with `commitTrailingTake`
+
+`commitTrailingTake(symbol, percentShift, currentPrice)` follows the same rules as `commitTrailingStop` but applies to the take-profit level. Use it to lock in gains while still allowing the trade to run if the trend continues.
+
+- A **negative** `percentShift` brings the TP closer to entry (more conservative — books profit sooner).
+- A **positive** `percentShift` moves the TP further from entry (more aggressive — chases the trend).
+
+Like its stop counterpart, the change is absorbed only if it moves the TP in the protective direction. For a long position the TP can only decrease (locking in a lower but guaranteed profit target); for a short it can only increase.
+
+```typescript
+// Pull TP closer by 1% once the trade is in profit territory
+await commitTrailingTake(symbol, -1, currentPrice);
+```
+
+To set the TP to a precise price, use `commitTrailingTakeCost(symbol, takeProfitPrice)`.
+
+## Breakeven Protection with `commitBreakeven`
+
+`commitBreakeven(symbol)` moves the stop-loss to the original entry price once the position has moved far enough in profit to cover fees (0.1 %) and slippage (0.1 %). This is a one-time operation per signal: once breakeven is reached, the SL is locked at entry and the function becomes a no-op for subsequent calls.
+
+The framework calculates the exact threshold automatically — you do not need to hard-code a fee percentage. Call `commitBreakeven` on every active ping and the engine will apply it exactly once at the right moment.
+
+```typescript
+listenActivePing(async ({ symbol, currentPrice }) => {
+  // Idempotent — safe to call every minute; fires once when threshold is crossed
+  await commitBreakeven(symbol);
+});
+```
+
+You can also read breakeven status programmatically:
+
+```typescript
+const hasReachedBreakeven = await getBreakeven(symbol, currentPrice);
+```
+
+## Position Helper: `Position.moonbag()`
+
+`Position.moonbag({ position, currentPrice, percentStopLoss })` is a convenience factory that constructs a signal with a hard stop loss at `percentStopLoss` percent below (long) or above (short) the current price and no fixed take-profit (`Infinity`). It is the standard starting point for DCA ladder strategies that rely on trailing exits or profit-target closes rather than a fixed TP level.
+
+```typescript
+const signal = {
+  position: "long",
+  ...Position.moonbag({
+    position: "long",
+    currentPrice,
+    percentStopLoss: 25,
+  }),
+  minuteEstimatedTime: Infinity,
+  cost: 100,
+};
+```
+
+## Position Helper: `Position.bracket()`
+
+`Position.bracket({ position, currentPrice, percentTakeProfit, percentStopLoss })` constructs a symmetric bracket signal with both a TP and an SL at fixed percentages from the current price. Use it for mean-reversion strategies where you want a defined risk/reward structure.
+
+```typescript
+const signal = {
+  position: "long",
+  ...Position.bracket({
+    position: "long",
+    currentPrice,
+    percentTakeProfit: 2,
+    percentStopLoss: 2,
+  }),
+  minuteEstimatedTime: 60,
+  cost: 100,
+};
+```
+
+## Position PnL Helpers
+
+Use these helpers to read the current profitability of an open position from inside any listener:
+
+| Function | Returns |
+| --- | --- |
+| `getPositionPnlPercent(symbol)` | Unrealized PnL as a percentage, net of fees and slippage |
+| `getPositionPnlCost(symbol)` | Unrealized PnL in dollars |
+
+Both functions return `null` when no position is open for the given symbol.
+
+```typescript
+listenActivePing(async ({ symbol }) => {
+  const pnlPercent = await getPositionPnlPercent(symbol);
+  if (pnlPercent === null) return;
+  console.log(`Current PnL: ${pnlPercent.toFixed(2)}%`);
+});
+```
+
+## Complete Example: DCA Ladder Strategy
+
+The following example combines all of the concepts above into a practical DCA ladder that:
+
+1. Opens a long position immediately on every new signal.
+2. Adds DCA rungs on each active ping, subject to step-count and overlap guards.
+3. Closes the entire position when total PnL reaches the profit target.
+
+```typescript
+import {
+  addStrategySchema,
+  listenActivePing,
+  listenError,
+  Log,
+  Position,
+  commitClosePending,
+  commitAverageBuy,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+} from "backtest-kit";
+import { errorData, getErrorMessage, str } from "functools-kit";
+
+const HARD_STOP = 25.0;        // Hard stop-loss at 25% below entry
+const TARGET_PROFIT = 3;       // Close the entire position at +3% blended PnL
+const LADDER_STEP_COST = 100;  // $100 per DCA rung
+const LADDER_UPPER_STEP = 5;   // Don't add if price is within 5% above an existing entry
+const LADDER_LOWER_STEP = 1;   // Don't add if price is within 1% below an existing entry
+const LADDER_MAX_STEPS = 10;   // Maximum 10 rungs total
+
+// Strategy: open a moonbag long on every new signal
+addStrategySchema({
+  strategyName: "apr_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: "long",
+      ...Position.moonbag({
+        position: "long",
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: LADDER_STEP_COST,
+    };
+  },
+});
+
+// Add DCA rungs while the position is active
+listenActivePing(async ({ symbol, currentPrice }) => {
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) {
+    return;
+  }
+
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) {
+    return;
+  }
+
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+// Close when blended PnL reaches the profit target
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  console.log(new Date(timestamp));
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) {
+    return;
+  }
+  Log.info("position closed due to the target pnl reached", { symbol, data });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: str.newline("# Closed by target pnl"),
+  });
+});
+
+// Surface errors without crashing the process
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+<Note>
+  The `commitAverageBuy` call automatically recalculates the harmonic mean effective entry price after each new rung. When `getPositionPnlPercent` later reports the current profit, it is measured against this blended average — not just the first entry — giving you an accurate view of the position's actual profitability across all ladder levels.
+</Note>

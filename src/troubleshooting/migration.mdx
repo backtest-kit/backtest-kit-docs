@@ -1,0 +1,475 @@
+---
+title: "Migrating to Backtest Kit from Backtrader, VectorBT"
+sidebarTitle: "Migration"
+description: "Migrate your trading strategy to Backtest Kit from Backtrader, VectorBT, Freqtrade, or MetaTrader with step-by-step framework mapping."
+---
+
+Migrating an existing strategy to a new framework always carries some friction, but the payoff is significant: you gain crash-safe persistence, automatic look-ahead bias protection, and a transactional execution layer that eliminates the state corruption bugs that plague most trading systems. This guide explains the key conceptual differences between Backtest Kit and other popular frameworks, provides a general migration roadmap, and then covers framework-specific mappings for the four most common migration sources.
+
+## Key Conceptual Differences
+
+Understanding three fundamental design differences makes the rest of the migration straightforward.
+
+**State machines vs. mutable state**
+
+Most frameworks represent a position as a Python dictionary or a mutable object with fields you update directly. Backtest Kit represents positions as a TypeScript discriminated union — a type-safe state machine where the compiler enforces which operations are valid at each lifecycle stage. You cannot accidentally read the `priceClosed` field of a position that is still open, because that field does not exist in the `active` state type.
+
+**Temporal context vs. manual timestamps**
+
+In Backtrader, VectorBT, and most other frameworks, you are responsible for tracking "now" — passing `self.datetime.date()` or a similar timestamp into every function that needs it. Backtest Kit uses Node.js `AsyncLocalStorage` to propagate the current simulation time through the entire call stack automatically. Any function that fetches candles or order book data receives the correct temporal boundary without you writing a single timestamp argument.
+
+**Transactional commits vs. manual rollbacks**
+
+When an exchange API call fails in a conventional bot, you must write `try/catch` blocks that undo every state mutation you made before the failure. Backtest Kit's broker adapter intercepts every mutation before the internal state changes. If your adapter throws, the framework rolls back automatically and retries on the next tick. You write the happy path only.
+
+## General Migration Steps
+
+<Steps>
+  <Step title="Extract your signal generation logic">
+    Identify the core logic that decides when to enter a trade. In most frameworks this is a `next()` method, a vectorized boolean array, or a `populate_entry_trend()` function. Pull this logic out into a standalone function that takes price and indicator data as inputs and returns a direction (long, short, or null).
+
+    Keep this function pure — no side effects, no state reads, just calculations on the data you pass in. You will wire it into `getSignal` in the next step.
+  </Step>
+  <Step title="Map your logic to the getSignal function">
+    Create a Backtest Kit strategy schema and move your extracted logic into the `getSignal` async function. Use `getCandles` for historical data fetching — this is the function that enforces the temporal boundary and prevents look-ahead bias:
+
+    ```typescript
+    import { addStrategySchema, getCandles } from 'backtest-kit';
+    
+    addStrategySchema({
+      strategyName: 'my-migrated-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        const candles = await getCandles(symbol, '1h', 50);
+        const signal = mySignalLogic(candles, currentPrice);
+    
+        if (signal === null) return null;
+    
+        return {
+          position: signal.direction,
+          priceOpen: currentPrice,
+          priceTake: signal.takeProfit,
+          priceStop: signal.stopLoss,
+          cost: 100,
+          minuteEstimatedTime: 60 * 24,
+        };
+      },
+    });
+    ```
+  </Step>
+  <Step title="Configure your risk management schema">
+    Replace any position-sizing or portfolio-level risk checks with a `addRiskSchema` registration. The framework evaluates your risk functions before every signal and rejects those that violate the rules:
+
+    ```typescript
+    import { addRiskSchema } from 'backtest-kit';
+    
+    addRiskSchema({
+      riskName: 'my-risk-profile',
+      strategyName: 'my-migrated-strategy',
+      validate: async ({ signal, activePositions }) => {
+        // Reject if more than 3 positions are open
+        if (activePositions >= 3) {
+          return { ok: false, reason: 'Max concurrent positions reached' };
+        }
+        // Reject if risk/reward is below 1.5:1
+        const rr = Math.abs(signal.priceTake - signal.priceOpen) /
+                   Math.abs(signal.priceStop - signal.priceOpen);
+        if (rr < 1.5) {
+          return { ok: false, reason: `R/R ratio ${rr.toFixed(2)} below minimum 1.5` };
+        }
+        return { ok: true };
+      },
+    });
+    ```
+  </Step>
+  <Step title="Set up a broker adapter for live trading">
+    Create `modules/live.module.ts` and implement the `IBroker` hooks that your exchange requires. At minimum you need `onSignalOpenCommit` and `onSignalCloseCommit`. See the [Broker Adapter](/configuration/broker-adapter) page for a complete example.
+
+    Start with only the hooks your strategy uses — unimplemented hooks are silently skipped. Add more hooks as you expand the strategy to use partial closes, DCA, or trailing stops.
+  </Step>
+  <Step title="Test in paper mode">
+    Run with `--paper` to exercise the full code path — including your broker adapter — on live market prices without placing real orders. Paper mode uses the identical execution engine as live trading, so any bugs in your adapter or signal logic will surface here:
+
+    ```bash
+    npx @backtest-kit/cli --paper ./src/index.ts --symbol BTCUSDT --ui
+    ```
+
+    Monitor the web dashboard and confirm that positions open and close according to your strategy logic before proceeding to live trading.
+  </Step>
+  <Step title="Deploy to live trading">
+    Once paper trading confirms the strategy behaves correctly, switch to `--live`. Add `--telegram` to receive real-time notifications for every position event:
+
+    ```bash
+    npx @backtest-kit/cli --live ./src/index.ts --symbol BTCUSDT --ui --telegram
+    ```
+
+    For production deployments, configure `@backtest-kit/mongo` in `config/setup.config.ts` so that position state survives container restarts. See the [Persistence](/configuration/persistence) page for setup instructions.
+  </Step>
+</Steps>
+
+## Framework-Specific Migration Guide
+
+<Tabs>
+  <Tab title="Backtrader">
+    ### What's Different
+
+    Backtrader's core paradigm is a `Strategy` class with a `next()` method that is called on every bar. State is tracked in mutable instance variables (`self.position`, `self.order`, etc.), and you interact with the broker directly through imperative calls like `self.buy()` and `self.sell()`.
+
+    Backtest Kit separates concerns more strictly: `getSignal` returns a declarative signal description (what you want to happen), and the framework decides when and how to execute it. You never call a "place order" function from `getSignal` — you return a signal object, and the framework handles the rest.
+
+    ### Key Mapping
+
+    | Backtrader Concept | Backtest Kit Equivalent |
+    | --- | --- |
+    | `Strategy.next()` | `getSignal` \+ `listenActivePing` |
+    | `self.buy(size=..., price=...)` | Return signal from `getSignal` |
+    | `self.close()` | `commitClosePending(symbol, {...})` inside `listenActivePing` |
+    | `self.position.size` | `getPositionEntries(symbol)` \+ `getPositionPnlPercent(symbol)` |
+    | `self.datas[0].close[0]` | `getCandles(symbol, '1d', 1)` — last closed candle |
+    | `self.datas[0].close[-1]` | `currentPrice` parameter in `getSignal` |
+    | `bt.analyzers.SharpeRatio` | Built-in Markdown report (generated automatically) |
+    | `cerebro.addsizer(bt.sizers.FixedSize)` | `cost` field in the signal object |
+    | `@bt.indicator` decorator | `Cache.fn` for memoized indicator calculations |
+
+    **Example: Backtrader moving average crossover → Backtest Kit**
+
+    ```typescript
+    // Backtrader (Python)
+    // class SmaCross(bt.Strategy):
+    //     def next(self):
+    //         if self.sma_fast > self.sma_slow and not self.position:
+    //             self.buy(size=1)
+    //         elif self.sma_fast < self.sma_slow and self.position:
+    //             self.close()
+    
+    // Backtest Kit (TypeScript)
+    import { addStrategySchema, getCandles, listenActivePing, commitClosePending } from 'backtest-kit';
+    
+    function computeSMA(candles: { close: number }[], period: number): number {
+      const slice = candles.slice(-period);
+      return slice.reduce((sum, c) => sum + c.close, 0) / slice.length;
+    }
+    
+    addStrategySchema({
+      strategyName: 'sma-cross',
+      interval: '1h',
+      getSignal: async (symbol, when, currentPrice) => {
+        const candles = await getCandles(symbol, '1h', 50);
+        const smaFast = computeSMA(candles, 10);
+        const smaSlow = computeSMA(candles, 30);
+    
+        if (smaFast <= smaSlow) return null;
+    
+        return {
+          position: 'long',
+          priceOpen: currentPrice,
+          priceTake: currentPrice * 1.05,
+          priceStop: currentPrice * 0.97,
+          cost: 100,
+          minuteEstimatedTime: 60 * 24 * 7,
+        };
+      },
+    });
+    
+    // "self.close()" equivalent: close when SMA crosses back
+    listenActivePing(async ({ symbol, currentPrice }) => {
+      const candles = await getCandles(symbol, '1h', 50);
+      const smaFast = computeSMA(candles, 10);
+      const smaSlow = computeSMA(candles, 30);
+    
+      if (smaFast < smaSlow) {
+        await commitClosePending(symbol, {
+          id: 'sma-cross-exit',
+          note: 'SMA crossed back — closing position',
+        });
+      }
+    });
+    ```
+
+    <Note>
+      Backtrader's `self.datas[0].close[-1]` refers to the current (incomplete) bar. Backtest Kit's `currentPrice` parameter is always the last closed candle's price — the pending bar is excluded automatically to prevent look-ahead bias.
+    </Note>
+  </Tab>
+  <Tab title="VectorBT">
+    ### What's Different
+
+    VectorBT operates on NumPy arrays and Pandas DataFrames. A backtest is a single vectorized pass over the entire price history: you compute entry and exit boolean arrays, pass them to `vbt.Portfolio.from_signals()`, and get a results object back. There is no "live execution" — you get results, not a deployable bot.
+
+    Backtest Kit is an execution engine, not a vectorized simulator. The same code that runs a backtest can be deployed to live trading without changes. The tradeoff is that you write event-driven logic instead of array operations, but you gain a system that is actually deployable.
+
+    ### Key Mapping
+
+    | VectorBT Concept | Backtest Kit Equivalent |
+    | --- | --- |
+    | `entries` boolean array | `getSignal` returning a signal when entry conditions are met |
+    | `exits` boolean array | `listenActivePing` calling `commitClosePending` when exit conditions are met |
+    | `pf.total_return()` | Markdown report summary (generated automatically) |
+    | `pf.sharpe_ratio()` | Markdown report Pooled Sharpe |
+    | `pf.max_drawdown()` | Markdown report Max Drawdown |
+    | `vbt.Portfolio.from_signals(sl_stop=0.02)` | `priceStop` field in signal object |
+    | `vbt.Portfolio.from_signals(tp_stop=0.05)` | `priceTake` field in signal object |
+    | `vbt.Portfolio.from_holding()` | Not applicable — Backtest Kit is event-driven |
+    | `data.run(RSI, ...)` | `getCandles` \+ any JS indicator library |
+
+    **Example: VectorBT RSI strategy → Backtest Kit**
+
+    ```typescript
+    // VectorBT (Python)
+    // rsi = vbt.RSI.run(price, window=14)
+    // entries = rsi.rsi_above(70)
+    // exits = rsi.rsi_below(30)
+    // pf = vbt.Portfolio.from_signals(price, entries, exits)
+    
+    // Backtest Kit (TypeScript)
+    import {
+      addStrategySchema,
+      getCandles,
+      listenActivePing,
+      commitClosePending,
+      Cache,
+    } from 'backtest-kit';
+    import { RSI } from 'technicalindicators';
+    
+    const computeRSI = Cache.fn(async (symbol: string) => {
+      const candles = await getCandles(symbol, '15m', 30);
+      const values = RSI.calculate({ values: candles.map(c => c.close), period: 14 });
+      return values[values.length - 1]; // most recent RSI value
+    });
+    
+    addStrategySchema({
+      strategyName: 'rsi-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        const rsi = await computeRSI(symbol);
+    
+        // Enter short when RSI is overbought (above 70)
+        if (rsi > 70) {
+          return {
+            position: 'short',
+            priceOpen: currentPrice,
+            priceTake: currentPrice * 0.95,
+            priceStop: currentPrice * 1.02,
+            cost: 100,
+            minuteEstimatedTime: 60 * 24,
+          };
+        }
+    
+        return null;
+      },
+    });
+    
+    listenActivePing(async ({ symbol }) => {
+      const rsi = await computeRSI(symbol);
+    
+      // Exit when RSI drops back below 30 (oversold)
+      if (rsi < 30) {
+        await commitClosePending(symbol, {
+          id: 'rsi-exit',
+          note: `RSI returned to ${rsi.toFixed(1)} — closing short`,
+        });
+      }
+    });
+    ```
+
+    <Tip>
+      VectorBT's `from_signals` processes the entire dataset in one pass, which makes it extremely fast for pure research. Backtest Kit processes candles tick-by-tick, which is slightly slower for large date ranges but produces a deployable system. Use `--noCache` only for quick iterations; let the framework warm the candle cache for full-speed runs.
+    </Tip>
+  </Tab>
+  <Tab title="Freqtrade">
+    ### What's Different
+
+    Freqtrade is a Python crypto trading bot with a well-defined strategy API. You implement `populate_entry_trend()` and `populate_exit_trend()` methods that add boolean columns to a Pandas DataFrame. Freqtrade handles the order placement and position tracking for you, but it has a flat position model — each pair can have at most one trade, and complex position management (DCA ladders, partial closes, trailing stops beyond simple percentages) requires workarounds.
+
+    Backtest Kit treats position management as a first-class feature. DCA entries, partial closes at multiple levels, trailing stop/take adjustments, and breakeven protection are all first-class operations with mathematically accurate cost-basis tracking.
+
+    ### Key Mapping
+
+    | Freqtrade Concept | Backtest Kit Equivalent |
+    | --- | --- |
+    | `populate_entry_trend()` | `getSignal` returning a signal |
+    | `populate_exit_trend()` | `listenActivePing` calling `commitClosePending` |
+    | `custom_sell()` | `listenActivePing` with custom logic |
+    | `confirm_trade_entry()` | Risk schema `validate` function |
+    | `custom_stoploss()` | `commitTrailingStop` inside `listenActivePing` |
+    | `adjust_trade_position()` | `commitAverageBuy` inside `listenActivePing` |
+    | `stoploss: -0.10` | `priceStop` field in signal object |
+    | `minimal_roi` | `priceTake` field in signal object |
+    | `use_custom_stoploss: True` | `commitTrailingStop` called manually |
+    | `position_adjustment_enable: True` | `commitAverageBuy` (no config flag needed) |
+    | `max_entry_position_adjustment: 3` | Check `(await getPositionEntries(symbol)).length` |
+
+    **Example: Freqtrade EMA strategy → Backtest Kit**
+
+    ```typescript
+    // Freqtrade (Python)
+    // def populate_entry_trend(self, dataframe, metadata):
+    //     dataframe.loc[
+    //         (dataframe['ema_fast'] > dataframe['ema_slow']) &
+    //         (dataframe['volume'] > 0),
+    //         'enter_long'] = 1
+    //     return dataframe
+    
+    // Backtest Kit (TypeScript)
+    import {
+      addStrategySchema,
+      getCandles,
+      listenActivePing,
+      commitAverageBuy,
+      commitClosePending,
+      getPositionEntries,
+      getPositionEntryOverlap,
+      getPositionPnlPercent,
+    } from 'backtest-kit';
+    
+    function ema(values: number[], period: number): number {
+      const k = 2 / (period + 1);
+      return values.reduce((prev, cur, i) =>
+        i === 0 ? cur : cur * k + prev * (1 - k)
+      );
+    }
+    
+    addStrategySchema({
+      strategyName: 'ema-cross',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        const candles = await getCandles(symbol, '15m', 50);
+        const closes = candles.map(c => c.close);
+        const emaFast = ema(closes, 9);
+        const emaSlow = ema(closes, 21);
+    
+        if (emaFast <= emaSlow) return null;
+    
+        return {
+          position: 'long',
+          priceOpen: currentPrice,
+          priceTake: currentPrice * 1.06,
+          priceStop: currentPrice * 0.97,
+          cost: 100,
+          minuteEstimatedTime: 60 * 48,
+        };
+      },
+    });
+    
+    // Freqtrade's adjust_trade_position → DCA in Backtest Kit
+    listenActivePing(async ({ symbol, currentPrice }) => {
+      const entries = await getPositionEntries(symbol);
+      if (entries.length >= 3) return; // max_entry_position_adjustment equivalent
+    
+      const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+        upperPercent: 3,
+        lowerPercent: 1,
+      });
+      if (hasOverlap) return;
+    
+      await commitAverageBuy(symbol, 50);
+    });
+    
+    // Exit when profit target is reached
+    listenActivePing(async ({ symbol }) => {
+      const pnl = await getPositionPnlPercent(symbol);
+      if (pnl >= 3.0) {
+        await commitClosePending(symbol, {
+          id: 'profit-target',
+          note: `Profit target reached: ${pnl.toFixed(2)}%`,
+        });
+      }
+    });
+    ```
+  </Tab>
+  <Tab title="MetaTrader / MQL5">
+    ### What's Different
+
+    MetaTrader (MQL5) strategies live inside a Windows-centric desktop application. You write Expert Advisors (EAs) in MQL5, a C\+\+-derived language with a proprietary runtime. Integration with external data sources, APIs, or modern cloud infrastructure requires complex DLL bridges or HTTP requests from within MQL5 scripts. Backtesting is done inside the MetaTrader Strategy Tester, which is separate from live deployment.
+
+    Backtest Kit runs in Node.js — the same JavaScript runtime that powers most modern web and cloud infrastructure. You can call any REST API, connect to WebSockets, run local Python code via WASM, or query a MongoDB database with the same language and tooling you already know. The backtest and live trading engines are identical, so there is no "Strategy Tester" vs. "live EA" split.
+
+    ### Key Mapping
+
+    | MQL5 / MetaTrader Concept | Backtest Kit Equivalent |
+    | --- | --- |
+    | `OnTick()` | `listenActivePing` (fires on each price update) |
+    | `OnBar()` / new candle event | `getSignal` (fires once per completed candle) |
+    | `OrderSend(OP_BUY, ...)` | Return signal from `getSignal` with `position: 'long'` |
+    | `OrderClose(ticket, ...)` | `commitClosePending(symbol, {...})` |
+    | `OrderModify(ticket, sl, tp)` | `commitTrailingStop` / `commitTrailingTake` |
+    | `iRSI(NULL, 0, 14, PRICE_CLOSE, 1)` | `getCandles` \+ any JS indicator library |
+    | `PositionSelect(symbol)` | `getSignal` state machine (no explicit check needed) |
+    | `AccountBalance()` | `cost` field controls position sizing |
+    | `SymbolInfoDouble(symbol, SYMBOL_BID)` | `currentPrice` parameter in `getSignal` |
+    | `.set` files (strategy parameters) | Environment variables \+ `addStrategySchema` fields |
+    | MetaTrader Strategy Tester | `npx @backtest-kit/cli --backtest` |
+    | MetaTrader Optimization | `npx @backtest-kit/cli --walker` (A/B comparison) |
+
+    **Example: MQL5 moving average EA → Backtest Kit**
+
+    ```typescript
+    // MQL5
+    // void OnBar() {
+    //   double ma_fast = iMA(NULL, 0, 10, 0, MODE_EMA, PRICE_CLOSE, 1);
+    //   double ma_slow = iMA(NULL, 0, 30, 0, MODE_EMA, PRICE_CLOSE, 1);
+    //   if (ma_fast > ma_slow && !PositionSelect(_Symbol)) {
+    //     OrderSend(_Symbol, OP_BUY, 0.01, Ask, 3, 0, 0);
+    //   }
+    // }
+    
+    // Backtest Kit (TypeScript)
+    import { addStrategySchema, getCandles, listenActivePing, commitClosePending } from 'backtest-kit';
+    
+    function emaValue(candles: { close: number }[], period: number): number {
+      const closes = candles.map(c => c.close);
+      const k = 2 / (period + 1);
+      return closes.reduce((prev, cur, i) => i === 0 ? cur : cur * k + prev * (1 - k));
+    }
+    
+    addStrategySchema({
+      strategyName: 'ma-ea',
+      interval: '1h',
+      getSignal: async (symbol, when, currentPrice) => {
+        const candles = await getCandles(symbol, '1h', 50);
+        const maFast = emaValue(candles, 10);
+        const maSlow = emaValue(candles, 30);
+    
+        if (maFast <= maSlow) return null;
+    
+        return {
+          position: 'long',
+          priceOpen: currentPrice,
+          priceTake: currentPrice * 1.04,
+          priceStop: currentPrice * 0.98,
+          cost: 100,
+          minuteEstimatedTime: 60 * 24 * 3,
+        };
+      },
+    });
+    
+    listenActivePing(async ({ symbol }) => {
+      const candles = await getCandles(symbol, '1h', 50);
+      const maFast = emaValue(candles, 10);
+      const maSlow = emaValue(candles, 30);
+    
+      if (maFast < maSlow) {
+        await commitClosePending(symbol, {
+          id: 'ma-cross-exit',
+          note: 'Fast MA crossed below slow MA',
+        });
+      }
+    });
+    ```
+
+    <Warning>
+      MetaTrader's `iMA(..., 1)` returns the value of the last **closed** bar (shift = 1). Backtest Kit's `getCandles` always returns closed candles — the pending bar is never included. This means `candles[candles.length - 1]` in Backtest Kit corresponds to `iMA(..., 1)` in MQL5, not `iMA(..., 0)`.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Benefits After Migration
+
+After completing the migration, you gain a set of guarantees that conventional frameworks cannot provide:
+
+**No state corruption.** The TypeScript discriminated union state machine makes invalid states unrepresentable at compile time. You cannot accidentally close a position that is already closed, or read a field that only exists on active positions while the signal is still idle.
+
+**No look-ahead bias.** The `AsyncLocalStorage` execution context automatically enforces temporal boundaries on every data access. The framework physically blocks requests for data beyond the current simulation timestamp at the adapter level — not just as a runtime check, but as an architectural constraint.
+
+**Automatic retry on exchange failure.** The transactional broker adapter means that network timeouts, rate limits, and exchange rejections are handled automatically. The framework rolls back and retries on the next tick without any manual intervention or rollback code.
+
+**Same code for backtest and live.** The strategy logic you validate in a backtest is identical to what runs in live trading — the same file, the same functions, the same framework. There is no "research mode" vs. "production mode" rewrite.
