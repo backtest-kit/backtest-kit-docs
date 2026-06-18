@@ -1,0 +1,306 @@
+---
+title: "What Is Backtest Kit? Framework Overview and Key Concepts"
+sidebarTitle: "Introduction"
+description: "Learn what Backtest Kit is, how it solves common algorithmic trading problems, and how it compares to tools like Backtrader, VectorBT, and Freqtrade."
+---
+
+Backtest Kit is a production-ready TypeScript framework for algorithmic trading. It gives you a unified execution engine — one that runs the same strategy code against historical candle data during backtesting and against live exchange prices during deployment, without any code changes. Write your signal logic once, validate it thoroughly, and ship it.
+
+Unlike research-focused libraries that require you to build a separate live-trading system from scratch, Backtest Kit is designed around the hardest problems in production trading: keeping your bot synchronized with the exchange after a crash, preventing look-ahead bias from corrupting your backtest results, and managing complex multi-entry positions with mathematically accurate cost-basis tracking.
+
+The framework is built on Node.js and TypeScript, runs in a single process, and ships with a zero-configuration CLI, a real-time web dashboard, Telegram notifications, and optional MongoDB and Redis persistence. It has been validated through 775\+ unit and integration tests and real-world trading deployments.
+
+---
+
+## Key problems Backtest Kit solves
+
+### Look-ahead bias
+
+Traditional frameworks require you to manually pass the current timestamp into every function call. One oversight and your strategy is silently reading future candle data, producing backtest results that can never be replicated in live trading.
+
+Backtest Kit uses Node.js `AsyncLocalStorage` to maintain an **ambient execution context**. Every candle request, indicator calculation, and order book query automatically knows exactly what "now" is. You cannot accidentally query future data because the engine blocks it at the adapter level.
+
+### State corruption
+
+When a trading system crashes during a position update, it often leaves the position in an ambiguous state — partially opened, unclear if closed, or stuck with the wrong cost basis. Recovering from this manually is fragile and error-prone.
+
+Backtest Kit enforces a strict signal lifecycle (`idle → scheduled → opened → active → closed`) using TypeScript discriminated unions, making invalid states unrepresentable at compile time. All state mutations are written atomically to disk before being considered complete, so the system always recovers to the last consistent state.
+
+### Exchange desync
+
+If an exchange API call fails mid-operation, the common pattern is to write `try/catch` blocks that manually roll back local variables. This is difficult to get right and breaks silently when developers miss an edge case.
+
+Backtest Kit's broker adapter intercepts every trade mutation **before** internal state changes. If the exchange throws an error, the framework automatically rolls back the position state and retries on the next tick. You never write rollback logic.
+
+### Fragile production deploys
+
+Most trading frameworks are research tools first. Moving a strategy from a Jupyter Notebook to a live server typically means rewriting significant parts of the codebase and managing exchange connectivity, process restarts, and monitoring from scratch.
+
+Backtest Kit includes Docker support with pre-configured `docker-compose`, crash-safe file persistence with MongoDB and Redis options, Telegram alerts, and a web dashboard — all wired up through the CLI with a single flag. The same strategy file runs in backtest mode today and live mode next week.
+
+---
+
+## How Backtest Kit compares
+
+| Feature | Backtest Kit | Backtrader | VectorBT | MetaTrader / MQL5 | QuantConnect | Freqtrade |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Language** | TypeScript | Python | Python | MQL5 | C# / Python | Python |
+| **Live trading** | ✅ Built-in | ⚠️ Manual | ❌ Research only | ✅ Built-in | ✅ Built-in | ✅ Built-in |
+| **Look-ahead bias prevention** | ✅ Enforced by engine | ⚠️ Manual discipline | ⚠️ Manual discipline | ⚠️ Manual discipline | ⚠️ Partial | ⚠️ Partial |
+| **Crash-safe persistence** | ✅ Atomic writes \+ MongoDB | ❌ No | ❌ No | ❌ No | ⚠️ Cloud-managed | ⚠️ Basic |
+| **Transactional broker commits** | ✅ Automatic rollback | ❌ No | ❌ No | ❌ No | ⚠️ Partial | ⚠️ Basic |
+| **Type-safe state machine** | ✅ Compile-time | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No |
+| **DCA / partial closes** | ✅ First-class | ⚠️ Manual | ⚠️ Manual | ⚠️ Manual | ⚠️ Manual | ⚠️ Limited |
+| **AI / LLM integration** | ✅ Built-in adapter | ❌ No | ❌ No | ❌ No | ⚠️ Custom | ❌ No |
+| **Pine Script execution** | ✅ Native | ❌ No | ❌ No | ✅ Native | ❌ No | ❌ No |
+| **Web dashboard** | ✅ Built-in | ❌ No | ❌ No | ✅ Desktop GUI | ✅ Cloud UI | ✅ Basic UI |
+| **Self-hosted** | ✅ 100% | ✅ Yes | ✅ Yes | ⚠️ Windows desktop | ❌ Cloud push | ✅ Yes |
+| **Docker support** | ✅ Built-in | ❌ No | ❌ No | ❌ No | ⚠️ Lean engine | ✅ Yes |
+
+---
+
+## Package overview
+
+Backtest Kit is organized as a focused monorepo. The core package handles everything required to write and run strategies; the optional packages add capabilities for specific use cases.
+
+### `backtest-kit` (core)
+
+The foundation of the framework. Provides the signal lifecycle state machine, execution context propagation via `AsyncLocalStorage`, crash-safe file persistence, risk management, DCA and partial close mechanics, trailing stops, breakeven protection, and the reporting engine. This is the only package you need to write strategies.
+
+### `@backtest-kit/cli`
+
+The zero-boilerplate command-line runner. Point it at any strategy file and choose a mode: `--backtest`, `--paper`, `--live`, or `--walker` (A/B comparison). The CLI handles candle cache warming, web dashboard launch, Telegram notifications, broker adapter loading via module hooks, and graceful shutdown on `SIGINT`. No infrastructure code required in your strategy files.
+
+### `@backtest-kit/signals`
+
+A pre-built indicator library with 50\+ technical analysis functions — RSI, MACD, Bollinger Bands, Stochastic, ADX, ATR, CCI, Fibonacci, support/resistance levels, and more. Handles multi-timeframe synchronization automatically and generates structured Markdown reports optimized for LLM context injection.
+
+### `@backtest-kit/pinets`
+
+Runs native TradingView Pine Script (v5/v6) directly inside Node.js. Use any existing Pine Script indicator without rewriting it in TypeScript. The package handles execution context, ensuring all Pine Script calculations are synchronized with the backtest timeline and protected against look-ahead bias.
+
+### `@backtest-kit/ollama`
+
+A universal LLM inference adapter that abstracts 10\+ providers — OpenAI, Claude, DeepSeek, Grok, Mistral, Perplexity, Cohere, Alibaba, Hugging Face, and local Ollama models — behind a single API. Supports structured output enforcement via Zod schemas, automatic API key rotation, and fallback chains for production resilience.
+
+### `@backtest-kit/mongo`
+
+Swaps the default file-based persistence for a production-grade MongoDB \+ Redis backend. A single `setup()` call registers all 15 persistence adapters. Strategy code requires zero changes. MongoDB provides durable signal history with compound indexes; Redis provides O(1) lookups with automatic cache invalidation.
+
+---
+
+## Core API surface
+
+This section covers the key functions and classes you will use in every strategy.
+
+### Registering schemas
+
+Three registration functions wire your strategy, exchange, and backtest time window into the framework. Call them at the top level of your entry point file before the CLI runs any strategy.
+
+```typescript
+import { addStrategySchema, addExchangeSchema, addFrameSchema } from 'backtest-kit';
+import ccxt from 'ccxt';
+
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+addFrameSchema({
+  frameName: 'feb-2026',
+  interval: '1m',
+  startDate: new Date('2026-02-01'),
+  endDate: new Date('2026-02-28'),
+});
+
+addStrategySchema({
+  strategyName: 'my-strategy',
+  interval: '15m',
+  getSignal: async (symbol, when, currentPrice) => {
+    return null; // return a signal object to open a position
+  },
+});
+```
+
+### Position helpers
+
+`Position.bracket` attaches a symmetrical take-profit and stop-loss to a signal in one call. `Position.moonbag` sets only a stop-loss, leaving the take-profit open-ended — useful for DCA ladders where you plan to close manually or via a profit target.
+
+```typescript
+import { Position } from 'backtest-kit';
+
+// Fixed bracket: 2% TP, 1% SL
+const bracketLevels = Position.bracket({
+  position: 'long',
+  currentPrice,
+  percentTakeProfit: 2.0,
+  percentStopLoss: 1.0,
+});
+
+// Moonbag: 25% hard stop, no fixed TP
+const moonbagLevels = Position.moonbag({
+  position: 'long',
+  currentPrice,
+  percentStopLoss: 25.0,
+});
+```
+
+Both helpers return `{ priceTarget, stopLoss }` price levels that you spread directly into the signal object returned from `getSignal`.
+
+### Warming the candle cache
+
+`warmCandles` pre-fetches OHLCV data for a symbol and interval into the local cache before a backtest or multi-symbol run starts. The CLI does this automatically for single-symbol runs, but you call it yourself when using `Backtest.background()` for parallel execution.
+
+```typescript
+import { warmCandles } from 'backtest-kit';
+
+await warmCandles({
+  exchangeName: 'binance',
+  from: new Date('2026-02-01T00:00:00Z'),
+  to: new Date('2026-02-28T23:59:59Z'),
+  interval: '1m',
+  symbol: 'BTCUSDT',
+});
+```
+
+### Parallel execution
+
+`Backtest.background()` and `Live.background()` run a strategy for a single symbol inside the current process without blocking the event loop. Call them in a loop to process multiple symbols concurrently — all runs share the same Node.js process, Mongo connection, and Redis cache.
+
+```typescript
+import { Backtest, Live } from 'backtest-kit';
+
+// Run backtest for multiple symbols concurrently
+const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+for (const symbol of symbols) {
+  Backtest.background(symbol, {
+    strategyName: 'my-strategy',
+    exchangeName: 'binance',
+    frameName: 'feb-2026',
+  });
+}
+
+// For paper or live trading, use Live.background() instead
+Live.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+});
+```
+
+---
+
+## Signal lifecycle
+
+Every trading position follows a strict lifecycle enforced by TypeScript discriminated unions:
+
+1. **Idle** — no active signal; the strategy is monitoring the market.
+2. **Scheduled** — a signal has been created but is waiting for the entry price to be reached.
+3. **Opened** — the position has been established; monitoring for exit conditions begins.
+4. **Active** — the position is in profit or loss; trailing stops are active.
+5. **Closed** — the position has been exited via take-profit, stop-loss, manual close, or timeout.
+
+Each state exposes only the data relevant to that stage. Attempting to access or modify data that belongs to a different state produces a compile-time error, eliminating entire classes of runtime state-corruption bugs.
+
+---
+
+## The "fool-proof" API
+
+A common critique of trading frameworks is their steep learning curve and the ease with which a developer can introduce catastrophic bugs. Backtest Kit is intentionally designed with a **"fool-proof" API surface** that restricts dangerous primitives and forces you into the "pit of success."
+
+**Ambient temporal context** — you never pass a timestamp into indicator calls. The engine knows the current simulation time via `AsyncLocalStorage` and blocks any attempt to request future data at the adapter level.
+
+**Guarded DCA** — `commitAverageBuy` uses a harmonic mean calculation and rejects any call that would worsen your effective entry price, preventing accidental averaging up.
+
+**Transactional broker commits** — the broker adapter intercepts every mutation before internal state changes. Exchange rejections roll back automatically; you never write rollback logic.
+
+**Automatic signal validation** — before a signal reaches the execution engine it is checked for logical soundness: TP/SL relationship, risk/reward minimum, interval throttling, and more.
+
+The following example shows a complete DCA ladder strategy using `Position.moonbag`, `commitAverageBuy`, `getPositionEntries`, `getPositionEntryOverlap`, and `commitClosePending`:
+
+```typescript
+import {
+  addStrategySchema,
+  listenError,
+  listenActivePing,
+  Log,
+  Position,
+  commitClosePending,
+  getPositionPnlPercent,
+  getPositionEntryOverlap,
+  getPositionEntries,
+  commitAverageBuy,
+} from 'backtest-kit';
+
+const HARD_STOP = 25.0;
+const TARGET_PROFIT = 3;
+const LADDER_STEP_COST = 100;
+const LADDER_UPPER_STEP = 5;
+const LADDER_LOWER_STEP = 1;
+const LADDER_MAX_STEPS = 10;
+
+addStrategySchema({
+  strategyName: 'apr_2026_strategy',
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: 'long',
+      ...Position.moonbag({
+        position: 'long',
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: Infinity,
+      cost: LADDER_STEP_COST,
+    };
+  },
+});
+
+listenActivePing(async ({ symbol, currentPrice }) => {
+  const { length: steps } = await getPositionEntries(symbol);
+  if (steps >= LADDER_MAX_STEPS) return;
+
+  const hasOverlap = await getPositionEntryOverlap(symbol, currentPrice, {
+    upperPercent: LADDER_UPPER_STEP,
+    lowerPercent: LADDER_LOWER_STEP,
+  });
+  if (hasOverlap) return;
+
+  await commitAverageBuy(symbol, LADDER_STEP_COST);
+});
+
+listenActivePing(async ({ symbol, data, timestamp }) => {
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < TARGET_PROFIT) return;
+
+  Log.info('position closed due to the target pnl reached', { symbol, data });
+  await commitClosePending(symbol, {
+    id: 'unknown',
+    note: '# Closed by target pnl',
+  });
+});
+
+listenError((error) => {
+  console.error(error);
+});
+```
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Scaffold a project and run your first backtest in under five minutes.
+  </Card>
+
+  <Card title="Installation" icon="download" href="/installation">
+    Install the core package and optional add-ons, configure your environment, and verify your setup.
+  </Card>
+</CardGroup>

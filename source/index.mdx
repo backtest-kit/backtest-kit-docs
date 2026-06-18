@@ -1,0 +1,164 @@
+---
+title: "Backtest Kit: Production-Ready Algorithmic Trading Framework"
+sidebarTitle: "Home"
+description: "Backtest Kit is a TypeScript framework for backtesting and deploying algorithmic trading strategies with crash-safe persistence and AI integration."
+---
+
+Backtest Kit gives you a production-ready TypeScript framework for algorithmic trading — so you can go from a strategy idea to a live, crash-safe bot without rewriting your codebase. Write your signal logic once, validate it against historical data, and deploy to live markets using the exact same code and the exact same CLI flag.
+
+<CardGroup cols={2}>
+  <Card
+    title="Get Started"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Scaffold a project, register an exchange, and run your first backtest in under five minutes.
+  </Card>
+  <Card
+    title="Core Concepts"
+    icon="book-open"
+    href="/introduction"
+  >
+    Understand the signal lifecycle, crash-safe persistence, look-ahead bias prevention, and the fool-proof API.
+  </Card>
+  <Card
+    title="CLI Reference"
+    icon="terminal"
+    href="/packages/cli"
+  >
+    Explore every CLI flag — backtest, paper, live, walker, UI dashboard, Telegram, and more.
+  </Card>
+  <Card
+    title="Strategy Examples"
+    icon="chart-candlestick"
+    href="/examples/overview"
+  >
+    Study production-quality strategies: neural networks, Pine Script, AI news sentiment, DCA ladders, and more.
+  </Card>
+</CardGroup>
+
+---
+
+## Get up and running in three steps
+
+<Steps>
+  <Step title="Scaffold a new project">
+    Run the init command to generate a fully configured project with example strategies, documentation, and all dependencies pre-wired.
+
+    ```bash
+    npx @backtest-kit/cli --init --output my-trading-bot
+    cd my-trading-bot
+    npm install
+    ```
+  </Step>
+  <Step title="Write your strategy">
+    Open `content/feb_2026.strategy.ts` (or create your own file) and register an exchange and a strategy. Return a signal from `getSignal` when your entry conditions are met, or `null` to stay flat. Use `Position.bracket` to attach a take-profit and stop-loss in one call, or `Position.moonbag` for a stop-loss-only open-ended position.
+
+    ```typescript
+    import { addExchangeSchema, addStrategySchema, Position } from 'backtest-kit';
+    import ccxt from 'ccxt';
+
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => {
+        const exchange = new ccxt.binance();
+        const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+        return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+          timestamp, open, high, low, close, volume,
+        }));
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        return {
+          position: 'long',
+          ...Position.bracket({
+            position: 'long',
+            currentPrice,
+            percentTakeProfit: 2.0,
+            percentStopLoss: 1.0,
+          }),
+          minuteEstimatedTime: 60 * 24,
+          cost: 100,
+        };
+      },
+    });
+    ```
+  </Step>
+  <Step title="Run a backtest">
+    Point the CLI at your strategy file and specify a trading pair. The CLI warms the candle cache, runs the simulation, and writes a Markdown report to `dump/`.
+
+    ```bash
+    npx @backtest-kit/cli --backtest ./content/feb_2026.strategy.ts --symbol BTCUSDT
+    ```
+
+    Add `--ui` to open the live web dashboard at `http://localhost:60050` while the backtest runs.
+
+    ```bash
+    npx @backtest-kit/cli --backtest ./content/feb_2026.strategy.ts --symbol BTCUSDT --ui
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Key features
+
+<CardGroup cols={3}>
+  <Card title="Crash-Safe Persistence" icon="shield-check" href="/introduction">
+    All state mutations are written atomically to disk. If the process crashes mid-operation, the system recovers to the last consistent state on restart — no phantom positions, no duplicate trades.
+  </Card>
+  <Card title="Look-Ahead Bias Prevention" icon="clock" href="/introduction">
+    An ambient execution context powered by Node.js `AsyncLocalStorage` makes it physically impossible to request future data. The same code runs identically in backtest and live modes.
+  </Card>
+  <Card title="Type-Safe State Machine" icon="diagram-project" href="/introduction">
+    Every signal moves through a strict lifecycle — `idle → scheduled → opened → active → closed`. TypeScript discriminated unions make invalid states unrepresentable at compile time.
+  </Card>
+  <Card title="Transactional Broker Commits" icon="arrows-rotate" href="/introduction">
+    The broker adapter intercepts every trade mutation before internal state changes. If the exchange rejects an order, the framework automatically rolls back state and retries on the next tick.
+  </Card>
+  <Card title="AI & LLM Integration" icon="microchip-ai" href="/introduction">
+    The `@backtest-kit/ollama` package provides a universal adapter for 10+ LLM providers — OpenAI, Claude, DeepSeek, Ollama, and more — with structured output enforcement and automatic token rotation.
+  </Card>
+  <Card title="Zero-Boilerplate CLI" icon="terminal" href="/packages/cli">
+    One command covers backtest, paper trading, and live deployment. The CLI handles candle caching, the web dashboard, Telegram notifications, and graceful shutdown — no infrastructure code required.
+  </Card>
+</CardGroup>
+
+---
+
+## Multi-symbol parallel execution
+
+To run a strategy across multiple symbols simultaneously, use `Backtest.background()` for historical simulation or `Live.background()` for paper and live trading. Both methods run inside a single Node.js process, sharing the same event loop and infrastructure — no IPC overhead.
+
+```typescript
+import { addExchangeSchema, addFrameSchema, addStrategySchema, Backtest, warmCandles } from 'backtest-kit';
+
+// ... register exchange, frame, and strategy schemas ...
+
+const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+
+for (const symbol of symbols) {
+  // Optionally pre-warm the candle cache for each symbol before backtesting
+  await warmCandles({
+    exchangeName: 'binance',
+    from: new Date('2026-02-01T00:00:00Z'),
+    to: new Date('2026-02-28T23:59:59Z'),
+    interval: '1m',
+    symbol,
+  });
+
+  Backtest.background(symbol, {
+    strategyName: 'my-strategy',
+    exchangeName: 'binance',
+    frameName: 'feb-2026',
+  });
+}
+```
+
+Use `Live.background()` in the same way for paper and live modes. Both accept the same options object.

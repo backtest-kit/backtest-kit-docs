@@ -1,0 +1,270 @@
+---
+title: "Backtest Kit Quickstart: From Zero to First Backtest"
+sidebarTitle: "Quickstart"
+description: "Scaffold your first Backtest Kit project, register an exchange and strategy, run a backtest, and review the results — all in under 5 minutes."
+---
+
+This guide takes you from zero to a running backtest in five steps. You will scaffold a project, connect to Binance via CCXT, register a strategy, and review the results. Before running live trades with real money, always validate your strategy in backtest mode first, then confirm behavior with paper trading.
+
+<Note>
+  Paper trading (`--paper` flag) uses live exchange prices but never places real orders — it is the safest way to verify that your position management, risk rules, and broker adapter all behave as expected before going live.
+</Note>
+
+<Steps>
+  <Step title="Scaffold a new project">
+    Run the `--init` command to generate a fully configured project directory. The CLI creates the folder structure, writes example strategy and Pine Script files, pre-configures `package.json` with all required dependencies, and immediately fetches the latest library documentation into `docs/lib/`.
+
+    ```bash
+    npx @backtest-kit/cli --init --output my-trading-bot
+    cd my-trading-bot
+    npm install
+    ```
+
+    After `npm install` completes, your project contains the following structure:
+
+    ```text
+    my-trading-bot/
+    ├── package.json              # pre-configured with all backtest-kit dependencies
+    ├── .gitignore
+    ├── CLAUDE.md                 # AI-agent guide for writing strategies
+    ├── content/
+    │   └── feb_2026.strategy.ts  # example strategy entry point
+    ├── docs/
+    │   ├── lib/                  # fetched library READMEs
+    │   ├── backtest_actions.md
+    │   ├── backtest_strategy_structure.md
+    │   └── ...
+    ├── math/
+    │   └── feb_2026.pine         # example Pine Script indicator
+    ├── modules/
+    │   ├── dump.module.ts        # exchange schema for --dump mode
+    │   └── pine.module.ts        # exchange schema for --pine mode
+    ├── report/
+    │   └── feb_2026.md           # example strategy research report
+    └── scripts/
+        └── fetch_docs.mjs        # utility: re-downloads library READMEs
+    ```
+  </Step>
+  <Step title="Register an exchange">
+    Open `content/feb_2026.strategy.ts` (or create your own file). Call `addExchangeSchema` to connect Backtest Kit to a data source. The example below uses CCXT's Binance connector, which works for backtesting without API keys.
+
+    Call `addFrameSchema` to define the historical time window the CLI will replay during backtest mode. You can create multiple frames and select between them with the `--frame` flag.
+
+    ```typescript
+    import { addExchangeSchema, addStrategySchema, addFrameSchema } from 'backtest-kit';
+    import ccxt from 'ccxt';
+    
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => {
+        const exchange = new ccxt.binance();
+        const ohlcv = await exchange.fetchOHLCV(
+          symbol,
+          interval,
+          since.getTime(),
+          limit
+        );
+        return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+          timestamp, open, high, low, close, volume,
+        }));
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+    
+    // Define the historical window for the backtest
+    addFrameSchema({
+      frameName: 'feb-2026',
+      interval: '1m',
+      startDate: new Date('2026-02-01'),
+      endDate: new Date('2026-02-28'),
+    });
+    ```
+  </Step>
+  <Step title="Register a strategy">
+    Call `addStrategySchema` in the same file to register your trading logic. The `getSignal` function receives the current symbol, timestamp, and price on every candle. Return a signal object to open a position, or `null` to stay flat.
+
+    ```typescript
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        // Your entry logic goes here.
+        // Return null to skip this candle.
+        return null;
+      },
+    });
+    ```
+
+    When you are ready to open positions, replace `return null` with a signal. Use `Position.bracket` to attach a take-profit and stop-loss in one call. For open-ended positions where you plan to close manually or via a profit target, use `Position.moonbag` instead — it sets only a stop-loss.
+
+    ```typescript
+    import { Position } from 'backtest-kit';
+    
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        // Fixed bracket: 2% take-profit, 1% stop-loss
+        return {
+          position: 'long',
+          ...Position.bracket({
+            position: 'long',
+            currentPrice,
+            percentTakeProfit: 2.0,
+            percentStopLoss: 1.0,
+          }),
+          minuteEstimatedTime: 60 * 24, // maximum position duration: 1 day
+          cost: 100,                     // USD amount to deploy
+        };
+      },
+    });
+    ```
+
+    For a DCA ladder that keeps adding to the position instead of closing at a fixed target, use `Position.moonbag` with a wide stop-loss and close programmatically once a profit threshold is reached:
+
+    ```typescript
+    import { Position } from 'backtest-kit';
+    
+    addStrategySchema({
+      strategyName: 'dca-strategy',
+      interval: '15m',
+      getSignal: async (symbol, when, currentPrice) => {
+        return {
+          position: 'long',
+          ...Position.moonbag({
+            position: 'long',
+            currentPrice,
+            percentStopLoss: 25.0,
+          }),
+          minuteEstimatedTime: Infinity,
+          cost: 100,
+        };
+      },
+    });
+    ```
+  </Step>
+  <Step title="Run a backtest">
+    Point the CLI at your strategy file and specify a trading symbol. The CLI automatically warms the candle cache for the intervals your strategy requires, runs the full simulation, and writes a Markdown report to `dump/`.
+
+    ```bash
+    npx @backtest-kit/cli --backtest ./content/feb_2026.strategy.ts --symbol BTCUSDT
+    ```
+
+    You can target a specific strategy, exchange, or frame by name if you have registered more than one:
+
+    ```bash
+    npx @backtest-kit/cli \
+      --backtest ./content/feb_2026.strategy.ts \
+      --symbol BTCUSDT \
+      --strategy my-strategy \
+      --exchange binance \
+      --frame feb-2026
+    ```
+
+    After the run completes, your results appear in the adjacent `dump/` directory:
+
+    ```text
+    content/dump/
+    ├── report/       # per-signal JSONL event log
+    ├── log/          # run log
+    └── markdown/     # human-readable Markdown report with PnL, Sharpe, drawdown
+    ```
+
+    The Markdown report includes total PnL, win rate, Sharpe ratio, Sortino ratio, maximum drawdown, recovery factor, and expectancy. On subsequent runs the CLI reuses the cached candle data — no additional API calls.
+  </Step>
+  <Step title="Launch the web dashboard">
+    Add the `--ui` flag to any command to launch the built-in real-time web dashboard alongside the backtest or live run.
+
+    ```bash
+    npx @backtest-kit/cli --backtest ./content/feb_2026.strategy.ts --symbol BTCUSDT --ui
+    ```
+
+    Open your browser and navigate to:
+
+    ```text
+    http://localhost:60050
+    ```
+
+    The dashboard shows live signal state transitions, position details (entry price, PnL, distance to TP/SL), risk rejection events, and multi-timeframe charts. You can inspect any open or closed position and trigger manual operations such as breakeven, partial close, or forced exit — without stopping the backtest.
+
+    To use a different port, set the `CC_WWWROOT_PORT` environment variable in your `.env` file.
+  </Step>
+</Steps>
+
+---
+
+## Running multiple symbols in parallel
+
+To backtest a strategy across several symbols at once, use `Backtest.background()` directly. The CLI's `--entry` flag tells it to skip its own symbol resolution and let your entry point call `Backtest.background()` for each symbol. You can also call `warmCandles` beforehand to pre-fill the cache.
+
+```typescript
+import {
+  addExchangeSchema,
+  addFrameSchema,
+  addStrategySchema,
+  Backtest,
+  warmCandles,
+} from 'backtest-kit';
+import ccxt from 'ccxt';
+
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+addFrameSchema({
+  frameName: 'feb-2026',
+  interval: '1m',
+  startDate: new Date('2026-02-01'),
+  endDate: new Date('2026-02-28'),
+});
+
+addStrategySchema({
+  strategyName: 'my-strategy',
+  interval: '15m',
+  getSignal: async (symbol) => null,
+});
+
+const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
+
+for (const symbol of symbols) {
+  await warmCandles({
+    exchangeName: 'binance',
+    from: new Date('2026-02-01T00:00:00Z'),
+    to: new Date('2026-02-28T23:59:59Z'),
+    interval: '1m',
+    symbol,
+  });
+
+  Backtest.background(symbol, {
+    strategyName: 'my-strategy',
+    exchangeName: 'binance',
+    frameName: 'feb-2026',
+  });
+}
+```
+
+Run with the `--entry` flag so the CLI defers symbol selection to your file:
+
+```bash
+npx @backtest-kit/cli --backtest --entry ./content/multi-symbol.ts
+```
+
+---
+
+## What's next?
+
+Now that your first backtest is running, explore the rest of the framework:
+
+- [**Installation**](/installation) — add optional packages for signals, Pine Script, LLM inference, and MongoDB persistence.
+- [**Introduction**](/introduction) — understand the signal lifecycle, crash-safe persistence, and how Backtest Kit prevents look-ahead bias.
+- [**CLI Reference**](/packages/cli) — learn every flag: `--paper`, `--live`, `--walker`, `--telegram`, `--entry`, and more.

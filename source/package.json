@@ -1,0 +1,10 @@
+{
+  "name": "source",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "mint dev"
+  },
+  "dependencies": {
+    "mint": "4.2.525"
+  }
+}

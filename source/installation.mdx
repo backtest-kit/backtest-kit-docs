@@ -1,0 +1,266 @@
+---
+title: "Install Backtest Kit: Core, CLI, and Optional Packages"
+sidebarTitle: "Installation"
+description: "Install backtest-kit core, the CLI runner, and optional packages for signals, Pine Script, LLM integration, and MongoDB persistence."
+---
+
+Backtest Kit is distributed as a set of focused npm packages. The core package and the CLI runner are required for every project; the remaining packages are optional and add capabilities for specific use cases such as technical analysis, Pine Script execution, LLM inference, and production-grade persistence.
+
+---
+
+## Prerequisites
+
+Before installing Backtest Kit, make sure your environment meets these requirements:
+
+- **Node.js 18 or later** — Backtest Kit uses `AsyncLocalStorage` for execution context propagation, which requires Node.js 18\+. Run `node --version` to confirm.
+- **npm, yarn, or pnpm** — any of the standard package managers work.
+- **TypeScript 5.0\+** (recommended) — all packages ship full TypeScript types. The CLI runs `.ts` files directly via `tsx`, so you do not need a separate compilation step during development.
+
+---
+
+## Core installation
+
+Install the `backtest-kit` core package and the CLI runner together. These two packages are required for every project.
+
+<CodeGroup>
+
+```bash npm
+npm install backtest-kit @backtest-kit/cli ccxt
+```
+
+```bash yarn
+yarn add backtest-kit @backtest-kit/cli ccxt
+```
+
+```bash pnpm
+pnpm add backtest-kit @backtest-kit/cli ccxt
+```
+
+</CodeGroup>
+
+`ccxt` is the standard exchange connectivity library used in every example. It provides Binance, Bybit, OKX, and 100\+ other exchange connectors.
+
+Add convenience scripts to your `package.json` so you do not have to type the full CLI command every time:
+
+```json package.json
+{
+  "scripts": {
+    "backtest": "npx @backtest-kit/cli --backtest ./src/index.ts",
+    "paper":    "npx @backtest-kit/cli --paper    ./src/index.ts",
+    "start":    "npx @backtest-kit/cli --live      ./src/index.ts"
+  },
+  "dependencies": {
+    "@backtest-kit/cli": "latest",
+    "backtest-kit": "latest",
+    "ccxt": "latest"
+  }
+}
+```
+
+---
+
+## Optional packages
+
+Install any of these packages to extend the core framework with additional capabilities.
+
+| Package | Description |
+| --- | --- |
+| `@backtest-kit/cli` | Zero-boilerplate CLI runner. Handles candle caching, web dashboard, Telegram, broker module hooks, and graceful shutdown. Required for `npx @backtest-kit/cli` usage. |
+| `@backtest-kit/signals` | 50\+ pre-built technical indicators (RSI, MACD, Bollinger Bands, ATR, ADX, CCI, Fibonacci, support/resistance). Handles multi-timeframe synchronization and generates Markdown reports for LLM context injection. |
+| `@backtest-kit/pinets` | Run native TradingView Pine Script v5/v6 directly inside Node.js. Extracts `plot()` outputs and maps them into your strategy signals. |
+| `@backtest-kit/ollama` | Universal LLM inference adapter for OpenAI, Claude, DeepSeek, Grok, Mistral, Perplexity, Cohere, Alibaba, Hugging Face, and local Ollama models. Includes structured output enforcement, API key rotation, and fallback chains. |
+| `@backtest-kit/mongo` | Swaps file-based persistence for MongoDB \+ Redis. A single `setup()` call registers all 15 persistence adapters. Zero strategy code changes required. |
+
+Install the packages you need:
+
+<CodeGroup>
+
+```bash npm
+npm install @backtest-kit/signals @backtest-kit/pinets @backtest-kit/ollama @backtest-kit/mongo
+```
+
+```bash yarn
+yarn add @backtest-kit/signals @backtest-kit/pinets @backtest-kit/ollama @backtest-kit/mongo
+```
+
+```bash pnpm
+pnpm add @backtest-kit/signals @backtest-kit/pinets @backtest-kit/ollama @backtest-kit/mongo
+```
+
+</CodeGroup>
+
+---
+
+## Environment setup
+
+Create a `.env` file in your project root. The CLI loads this file automatically before running any strategy.
+
+```env .env
+# Telegram notifications (required only if you use --telegram)
+CC_TELEGRAM_TOKEN=your_bot_token_here
+CC_TELEGRAM_CHANNEL=-100123456789
+
+# Web UI server (optional — shown values are the defaults)
+CC_WWWROOT_HOST=0.0.0.0
+CC_WWWROOT_PORT=60050
+
+# MongoDB persistence (required only if you use @backtest-kit/mongo)
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-kit
+
+# Redis cache (optional — used by @backtest-kit/mongo for O(1) lookups)
+CC_REDIS_HOST=127.0.0.1
+CC_REDIS_PORT=6379
+```
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `CC_TELEGRAM_TOKEN` | Only with `--telegram` | Telegram bot token from [@BotFather](https://t.me/botfather) |
+| `CC_TELEGRAM_CHANNEL` | Only with `--telegram` | Telegram channel or chat ID (e.g. `-100123456789`) |
+| `CC_WWWROOT_HOST` | No | UI server bind address. Default: `0.0.0.0` |
+| `CC_WWWROOT_PORT` | No | UI server port. Default: `60050` |
+| `CC_MONGO_CONNECTION_STRING` | Only with `@backtest-kit/mongo` | MongoDB connection string |
+| `CC_REDIS_HOST` | No | Redis host for `@backtest-kit/mongo` caching |
+| `CC_REDIS_PORT` | No | Redis port for `@backtest-kit/mongo` caching |
+
+If you use `@backtest-kit/mongo`, activate it by creating a setup config file. The CLI loads this before any strategy code runs:
+
+```typescript config/setup.config.ts
+import { setup } from '@backtest-kit/mongo';
+
+setup();
+```
+
+---
+
+## TypeScript setup
+
+Backtest Kit requires `moduleResolution` set to `bundler` (or `node16` / `nodenext`) for correct path resolution. Add this to your `tsconfig.json`:
+
+```json tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "./dist"
+  },
+  "include": [
+    "./src",
+    "./content",
+    "./modules",
+    "./config"
+  ]
+}
+```
+
+If you use the shared import alias feature (top-level folders as bare imports), also add a `paths` entry for each folder:
+
+```json tsconfig.json
+{
+  "compilerOptions": {
+    "moduleResolution": "bundler",
+    "paths": {
+      "utils": ["./utils/index.ts"],
+      "utils/*": ["./utils/*"],
+      "logic": ["./logic/index.ts"],
+      "logic/*": ["./logic/*"]
+    }
+  },
+  "include": [
+    "./utils",
+    "./logic",
+    "./content",
+    "./modules"
+  ]
+}
+```
+
+The CLI automatically registers every top-level folder as an import alias at runtime — the `tsconfig.json` `paths` entry just makes your editor resolve them correctly.
+
+---
+
+## Key API imports
+
+Once installed, the most commonly used exports from `backtest-kit` are:
+
+| Export | Description |
+| --- | --- |
+| `addStrategySchema` | Register a strategy with its `getSignal` function and interval |
+| `addExchangeSchema` | Register an exchange data source with candle fetching and price formatting |
+| `addFrameSchema` | Define a historical time window for backtest replay |
+| `Position.bracket` | Calculate take-profit and stop-loss levels as a fixed percentage bracket |
+| `Position.moonbag` | Calculate a stop-loss-only level for open-ended DCA positions |
+| `Backtest.background` | Start a backtest for a symbol in the background (multi-symbol parallel execution) |
+| `Live.background` | Start a paper or live run for a symbol in the background |
+| `warmCandles` | Pre-fetch and cache OHLCV data for a symbol and interval before a run |
+
+A minimal strategy file that uses all three registration functions looks like this:
+
+```typescript
+import { addStrategySchema, addExchangeSchema, addFrameSchema, Position } from 'backtest-kit';
+import ccxt from 'ccxt';
+
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+addFrameSchema({
+  frameName: 'feb-2026',
+  interval: '1m',
+  startDate: new Date('2026-02-01'),
+  endDate: new Date('2026-02-28'),
+});
+
+addStrategySchema({
+  strategyName: 'my-strategy',
+  interval: '15m',
+  getSignal: async (symbol, when, currentPrice) => {
+    return {
+      position: 'long',
+      ...Position.bracket({
+        position: 'long',
+        currentPrice,
+        percentTakeProfit: 2.0,
+        percentStopLoss: 1.0,
+      }),
+      minuteEstimatedTime: 60 * 24,
+      cost: 100,
+    };
+  },
+});
+```
+
+---
+
+## Verify your installation
+
+Run the CLI help command to confirm everything is installed correctly:
+
+```bash
+npx @backtest-kit/cli --help
+```
+
+You should see the full list of available flags printed to stdout. If you see an error, check that Node.js 18\+ is active (`node --version`) and that `backtest-kit` and `@backtest-kit/cli` are both listed in your `node_modules`.
+
+To verify the scaffolder works, create a test project in a temporary directory:
+
+```bash
+npx @backtest-kit/cli --init --output test-project
+cd test-project
+npm install
+npx @backtest-kit/cli --help
+```
+
+If `--help` prints successfully from inside `test-project`, your installation is complete.

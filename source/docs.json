@@ -1,0 +1,107 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Backtest Kit",
+  "theme": "luma",
+  "colors": {
+    "primary": "#1A56DB",
+    "light": "#EFF6FF",
+    "dark": "#0F172A"
+  },
+  "logo": {
+    "light": "/images/logo_light.png",
+    "dark": "/images/logo_dark.png"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/tripolskypetr/backtest-kit"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/signal-lifecycle",
+              "concepts/execution-modes",
+              "concepts/position-management",
+              "concepts/risk-management"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/writing-a-strategy",
+              "guides/backtesting",
+              "guides/live-trading",
+              "guides/ai-strategies",
+              "guides/multi-symbol"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment",
+              "configuration/persistence",
+              "configuration/broker-adapter"
+            ]
+          },
+          {
+            "group": "Troubleshooting",
+            "pages": [
+              "troubleshooting/common-issues",
+              "troubleshooting/migration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Packages",
+        "groups": [
+          {
+            "group": "CLI",
+            "pages": [
+              "packages/cli/overview",
+              "packages/cli/flags",
+              "packages/cli/monorepo"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "packages/signals",
+              "packages/pinets",
+              "packages/ollama",
+              "packages/mongo"
+            ]
+          },
+          {
+            "group": "Strategy Examples",
+            "pages": [
+              "examples/overview",
+              "examples/dca-ladder",
+              "examples/ai-news-sentiment",
+              "examples/pinescript-breakout"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/tripolskypetr/backtest-kit"
+    }
+  }
+}
